@@ -336,95 +336,17 @@ class TetraDecoder:
                 try:
                     # Create a temporary MacPDU with decrypted data
                     decrypted_bytes = bytes.fromhex(frame_data['decrypted_bytes'])
-                    # We need to reconstruct a MacPDU-like object or just pass bytes
-                    # For now, let's just try to parse text directly from bytes
                     
-                    # Try to find text in decrypted payload
-                    text_content = ""
-                    for b in decrypted_bytes:
-                        if 32 <= b <= 126:
-                            text_content += chr(b)
-                        else:
-                            text_content += "."
-                    
-                    clean_text = text_content.replace(".", "")
-                    if len(clean_text) > 4:
-                        frame_data['sds_message'] = clean_text
-                        frame_data['decoded_text'] = clean_text
-                        additional_info['sds_text'] = clean_text[:50]
+                    # Use protocol parser to handle SDS data properly
+                    sds_text = self.protocol_parser.parse_sds_data(decrypted_bytes)
+                    if sds_text:
+                        frame_data['sds_message'] = sds_text
+                        frame_data['decoded_text'] = sds_text
+                        additional_info['sds_text'] = sds_text[:50]
                 except:
                     pass
         
         return frame_data
-    
-    def _try_decode_text(self, data: bytes) -> str:
-        """
-        Try to decode text using various TETRA encodings.
-        """
-        if not data:
-            return ""
-            
-        # 0. Check for SDS User Data Header (UDH)
-        # If first byte is 0x82 (UDH present), skip it and the header
-        payload = data
-        if len(data) > 1:
-            # SDS-TL headers often start with 0x82, 0x83, 0x84
-            if data[0] in [0x82, 0x83, 0x84]:
-                # Simple heuristic: skip header (usually 2-5 bytes)
-                # Try skipping 2 bytes
-                if len(data) > 2:
-                    payload = data[2:]
-        
-        # 1. Try standard ISO-8859-1 (common in TETRA)
-        try:
-            text = payload.decode('iso-8859-1')
-            # Check if it looks like valid text (mostly printable)
-            printable = sum(1 for c in text if c.isprintable())
-            # Stricter threshold: > 95% printable and length > 3
-            if len(text) > 3 and printable / len(text) > 0.95:
-                return text
-        except:
-            pass
-            
-        # 2. Try 7-bit unpacking (TETRA SDS often uses 7-bit alphabet)
-        try:
-            # Unpack 7-bit septets from 8-bit octets
-            bits = BitArray(payload)
-            text = ""
-            # Read 7 bits at a time
-            while bits.len - bits.pos >= 7:
-                val = bits.read('uint:7')
-                if 32 <= val <= 126:
-                    text += chr(val)
-                elif val == 10 or val == 13: # CR/LF
-                    text += chr(val)
-                else:
-                    text += "."
-            
-            # Stricter check for 7-bit
-            printable = sum(1 for c in text if c.isprintable() and c != '.')
-            # Must be mostly printable, very few dots
-            if len(text) > 4 and printable / len(text) > 0.9:
-                return text.replace(".", "")
-        except:
-            pass
-            
-        # 3. Fallback: Clean 8-bit (only printable)
-        text = ""
-        printable_count = 0
-        for b in payload:
-            if 32 <= b <= 126:
-                text += chr(b)
-                printable_count += 1
-            else:
-                pass
-        
-        # Only return if we found significant text
-        # Very strict: must be almost entirely text to avoid showing binary garbage
-        if len(text) > 4 and printable_count / len(data) > 0.85:
-            return text
-            
-        return ""
 
     def _decrypt_frame(self, frame_data: dict) -> dict:
         """
@@ -638,12 +560,12 @@ class TetraDecoder:
                     payload_hex = frame['decrypted_bytes'][:64]
                     info += f"\n  📦 Payload (hex): {payload_hex}..."
                     
-                    # Try to decode as text - more lenient check
+                    # Try to decode as text using protocol parser
                     try:
                         payload_bytes = bytes.fromhex(frame['decrypted_bytes'])
-                        text = self._try_decode_text(payload_bytes)
-                        if text and len(text) > 3:
-                            info += f"\n  📝 Text: {text}"
+                        text = self.protocol_parser.parse_sds_data(payload_bytes)
+                        if text:
+                            info += f"\n  📝 Content: {text}"
                             frame['decoded_text'] = text  # Store for GUI
                     except:
                         pass

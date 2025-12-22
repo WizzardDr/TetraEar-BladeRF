@@ -469,7 +469,6 @@ class TetraProtocolParser:
     def parse_sds_message(self, mac_pdu: MacPDU) -> Optional[str]:
         """
         Parse Short Data Service (SDS) text message.
-        Demonstrates decoding of unencrypted data messages.
         
         Args:
             mac_pdu: MAC PDU containing SDS
@@ -477,53 +476,76 @@ class TetraProtocolParser:
         Returns:
             Decoded text message or None
         """
-        if mac_pdu.pdu_type != PDUType.MAC_DATA:
+        if mac_pdu.pdu_type != PDUType.MAC_DATA and mac_pdu.pdu_type != PDUType.MAC_SUPPL:
             return None
-        
-        if mac_pdu.encrypted:
-            # If we have decrypted data, use it
-            # The caller should have replaced mac_pdu.data with decrypted data if available
-            pass
         
         # SDS data is in the payload
-        data = mac_pdu.data
+        return self.parse_sds_data(mac_pdu.data)
+
+    def parse_sds_data(self, data: bytes) -> Optional[str]:
+        """
+        Parse SDS data payload based on Protocol Identifier (PID).
         
-        if len(data) < 2:
+        Args:
+            data: Raw data bytes
+            
+        Returns:
+            Decoded text string or None
+        """
+        if not data or len(data) < 1:
             return None
         
-        # Try to interpret as text directly first (heuristics)
-        try:
-            # Check if it looks like pure ASCII
-            text = data.decode('ascii')
-            if all(32 <= ord(c) <= 126 for c in text):
-                self.stats['data_messages'] += 1
-                return text
-        except:
-            pass
-
-        # SDS type (first byte usually)
-        # SDS-TL standard header is often 16-bit or 8-bit
-        # Let's try to skip headers and find text
+        # Protocol Identifier (PID) is usually the first byte
+        pid = data[0]
+        payload = data[1:]
         
-        # Heuristic: Look for printable sequences
-        try:
-            # Convert to string, replacing errors
-            text_content = ""
-            for b in data:
-                if 32 <= b <= 126:
-                    text_content += chr(b)
-                else:
-                    text_content += "."
-            
-            # If we have a significant chunk of text, return it
-            clean_text = text_content.replace(".", "")
-            if len(clean_text) > 3:
+        # ETSI EN 300 392-2 Protocol Identifiers
+        # 0x82: Text Messaging (Simple) - ISO 8859-1
+        # 0x83: Simple Location System
+        # 0x84: Wireless Application Protocol (WAP)
+        # 0x0C: GPS
+        # 0x03: Simple Text Messaging (8-bit)
+        
+        if pid == 0x82:  # Text Messaging
+            try:
+                # Text coding scheme is in the next byte usually, but for Simple Text it's often just text
+                # Let's try decoding as Latin-1 (ISO 8859-1)
+                text = payload.decode('latin-1')
                 self.stats['data_messages'] += 1
-                return clean_text
-        except:
-            pass
+                return f"[TXT] {text}"
+            except:
+                return f"[TXT] (Decode Error) {payload.hex()}"
+                
+        elif pid == 0x03:  # Simple Text Messaging
+            try:
+                text = payload.decode('ascii')
+                self.stats['data_messages'] += 1
+                return f"[TXT] {text}"
+            except:
+                return f"[TXT] (Decode Error) {payload.hex()}"
+                
+        elif pid == 0x83:  # Location
+            return f"[LOC] Location Data: {payload.hex()}"
             
-        return None
+        elif pid == 0x0C:  # GPS
+            return f"[GPS] GPS Data: {payload.hex()}"
+            
+        # If PID is not recognized, check if it looks like text anyway (fallback)
+        # Some networks might not use standard SDS-TL headers for internal messages
+        
+        # Check for 7-bit GSM packing or 8-bit text
+        # Heuristic: if > 80% of bytes are printable, treat as text
+        printable_count = sum(1 for b in data if 32 <= b <= 126 or b in (10, 13))
+        if len(data) > 0 and (printable_count / len(data)) > 0.8:
+             try:
+                text = data.decode('latin-1')
+                self.stats['data_messages'] += 1
+                return f"[RAW] {text}"
+             except:
+                pass
+        
+        # Default to Hex dump for binary data
+        return f"[BIN] {data.hex(' ').upper()}"
 
     def extract_voice_payload(self, mac_pdu: MacPDU) -> Optional[bytes]:
         """
