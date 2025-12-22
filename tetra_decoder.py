@@ -99,24 +99,29 @@ class TetraDecoder:
         
     def symbols_to_bits(self, symbols):
         """
-        Convert demodulated symbols (0-7) to bits (2 bits per symbol).
-        Maps 8-PSK sectors to π/4-DQPSK symbols (0-3).
+        Convert demodulated symbols to bits (2 bits per symbol).
+        Handles both 0-7 (8-PSK) and 0-3 (π/4-DQPSK) input formats.
         """
         bits = []
         mapped_symbols = []
         
+        # Check if symbols are already in 0-3 format (π/4-DQPSK)
+        max_symbol = np.max(symbols) if len(symbols) > 0 else 0
+        is_dqpsk = max_symbol <= 3
+        
         for s in symbols:
-            # Map 0-7 (8-PSK) to 0-3 (QPSK)
-            # 1 (π/4) -> 0 (00)
-            # 3 (3π/4) -> 1 (01)
-            # 5 (-3π/4) -> 3 (11)
-            # 7 (-π/4) -> 2 (10)
-            # Handle neighbors for noise tolerance
-            if s in [0, 1, 2]: val = 0   # 00
-            elif s in [3, 4]: val = 1    # 01
-            elif s in [5]: val = 3       # 11
-            elif s in [6, 7]: val = 2    # 10
-            else: val = 0
+            if is_dqpsk:
+                # Already in 0-3 format (π/4-DQPSK) - pass through
+                # Symbols 0-3 directly represent the bit pairs
+                val = int(s) & 0x3  # Ensure it's in range 0-3
+            else:
+                # Map 0-7 (8-PSK) to 0-3 (QPSK)
+                # Handle neighbors for noise tolerance
+                if s in [0, 1, 2]: val = 0   # 00
+                elif s in [3, 4]: val = 1    # 01
+                elif s in [5]: val = 3       # 11
+                elif s in [6, 7]: val = 2    # 10
+                else: val = 0
             
             mapped_symbols.append(val)
             bits.extend([val >> 1, val & 1])
@@ -140,24 +145,58 @@ class TetraDecoder:
         ts1_bits = [0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1] # 14 bits? Too short.
         
         # Let's use the standard 22-bit TS1
-        sync_pattern = np.array([1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 0])
-        sync_len = len(sync_pattern)
+        self.sync_patterns = {
+            'TS1': np.array([1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 0]),
+            'TS2': np.array([0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0]) # Example TS2
+        }
         
-        if len(bits) < sync_len:
+        if len(bits) < 22:
             return sync_positions
         
-        # Use sliding window with step size to speed up search
-        step = max(1, sync_len // 4)  # Check every 1/4 of pattern length
+        # Check every bit position (step=1) to ensure we don't miss sync
+        # Use numpy for faster correlation if possible
         
-        for i in range(0, len(bits) - sync_len, step):
-            window = bits[i:i+sync_len]
-            correlation = np.sum(window == sync_pattern) / sync_len
+        # Convert bits to numpy array if not already
+        if not isinstance(bits, np.ndarray):
+            bits = np.array(bits)
             
-            if correlation >= threshold:
-                sync_positions.append(i)
-                logger.debug(f"Found sync at position {i}, correlation: {correlation:.2f}")
-                # Skip ahead to avoid duplicate detections
-                i += sync_len
+        # Sliding window correlation
+        # Create a view of sliding windows
+        # shape: (num_windows, window_size)
+        sync_len = 22
+        num_windows = len(bits) - sync_len + 1
+        if num_windows <= 0:
+            return sync_positions
+            
+        # Simple loop is safer and easier to debug than stride_tricks for now
+        # Optimization: only check if first few bits match to avoid full correlation
+        
+        i = 0
+        max_corr = 0.0
+        while i < num_windows:
+            # Try both TS1 and TS2
+            for name, pattern in self.sync_patterns.items():
+                # Full correlation check - removed fragile "quick check"
+                window = bits[i:i+sync_len]
+                match_count = np.sum(window == pattern)
+                correlation = match_count / sync_len
+                
+                if correlation > max_corr:
+                    max_corr = correlation
+                
+                if correlation >= threshold:
+                    sync_positions.append(i)
+                    # logger.debug(f"Found {name} sync at position {i}, correlation: {correlation:.2f}")
+                    # Skip ahead to avoid duplicate detections (at least half a frame)
+                    i += 250  # TETRA frame is ~510 bits
+                    break # Found one, move to next frame
+            
+            i += 1
+            
+        if not sync_positions:
+             logger.debug(f"No sync found at threshold {threshold}. Max correlation: {max_corr:.4f}")
+        else:
+             logger.debug(f"Found {len(sync_positions)} syncs at threshold {threshold}. Max correlation: {max_corr:.4f}")
         
         return sync_positions
     
@@ -455,6 +494,10 @@ class TetraDecoder:
             for idx, common_key in enumerate(self.common_keys[algorithm]):
                 keys_to_try.append((common_key, f"{algorithm} common_key_{idx}"))
         
+        # Add BYPASS attempt (treat as clear) - User requested "try common,bypass"
+        # This handles cases where frames are marked encrypted but are actually clear (network config error)
+        keys_to_try.append((None, "BYPASS (Treat as Clear)"))
+        
         # Also try with other algorithms if primary fails
         for other_alg in ['TEA1', 'TEA2', 'TEA3', 'TEA4']:
             if other_alg != algorithm and other_alg in self.common_keys:
@@ -476,8 +519,12 @@ class TetraDecoder:
         
         for key, key_desc in keys_to_try:
             try:
-                decryptor = TEADecryptor(key, algorithm)
-                decrypted_payload = decryptor.decrypt(payload_bytes)
+                if key is None:
+                    # BYPASS mode - use payload as is
+                    decrypted_payload = payload_bytes
+                else:
+                    decryptor = TEADecryptor(key, algorithm)
+                    decrypted_payload = decryptor.decrypt(payload_bytes)
                 
                 # Score the decrypted data (how "good" it looks)
                 # More lenient scoring for TETRA
@@ -587,12 +634,20 @@ class TetraDecoder:
         bits, mapped_symbols = self.symbols_to_bits(symbols)
         
         # Find synchronization patterns (Training Sequence)
-        sync_positions = self.find_sync(bits, threshold=0.80)
+        # Use progressively lower thresholds to catch weaker/noisy signals
+        sync_positions = self.find_sync(bits, threshold=0.75)
         
         if not sync_positions:
-            sync_positions = self.find_sync(bits, threshold=0.70)
+            sync_positions = self.find_sync(bits, threshold=0.65)  # Lowered from 0.70
             if not sync_positions:
-                return []
+                sync_positions = self.find_sync(bits, threshold=0.55)  # Even more lenient
+                if not sync_positions:
+                    # If still no sync found, try to decode at regular intervals anyway
+                    # This helps with signals that have sync but it's corrupted
+                    # TETRA slots are 510 bits, so try every 510 bits
+                    if len(bits) >= self.FRAME_LENGTH:
+                        # Try decoding from start of bit stream (might be misaligned)
+                        sync_positions = [0]
         
         # Decode frames
         frames = []
@@ -614,14 +669,18 @@ class TetraDecoder:
                     # We pass the bits corresponding to the frame
                     frame_bits = bits[start_pos : start_pos + 510]
                     
-                    frame = self.decode_frame(frame_bits, 0, frame_symbols)
+                    # Calculate a pseudo frame number based on position
+                    # Assuming continuous stream, 510 bits per timeslot
+                    current_frame_num = start_pos // 510
+                    
+                    frame = self.decode_frame(frame_bits, 0, frame_symbols, frame_number=current_frame_num)
                     if frame:
                         frames.append(frame)
                         logger.info(f"Decoded frame {frame['number']} (type: {frame['type']})")
         
         return frames
 
-    def decode_frame(self, bits, start_pos, symbols=None):
+    def decode_frame(self, bits, start_pos, symbols=None, frame_number=0):
         """
         Decode a TETRA frame.
         """
@@ -634,11 +693,21 @@ class TetraDecoder:
         # Extract frame header (first 32 bits)
         header = frame[0:32]
         
-        # Extract frame type (first 4 bits)
-        frame_type = header[0:4].uint
+        # Extract frame type (first 2 bits for MAC PDU type)
+        # The previous logic took 4 bits, which confused PDU Type with Encryption Mode
+        # Standard Downlink MAC PDU Type is 2 bits.
+        pdu_type_int = header[0:2].uint
         
-        # Extract frame number (next 8 bits)
-        frame_number = header[4:12].uint
+        # Encryption Mode is usually next 2 bits (bits 2-3)
+        encryption_mode_int = header[2:4].uint
+        
+        # Extract frame number (next 8 bits? No, frame number is not in MAC header)
+        # Frame number is passed from the burst/slot counter in the decoder loop
+        # We'll keep using the passed 'frame_number' or 'number' from arguments if available
+        # But here we are parsing the bits.
+        
+        # Let's stick to the previous structure but fix the type mapping
+        frame_type = pdu_type_int
         
         # Parse additional fields based on frame type
         additional_info = {}
@@ -648,36 +717,37 @@ class TetraDecoder:
         if frame_type == 0:
             frame_type_name = "MAC-RESOURCE"
             additional_info['description'] = 'Resource allocation'
-            if len(header) >= 24:
-                additional_info['network_id'] = header[12:24].uint
+            # Network ID is not in fixed position, depends on TM-SDU
         elif frame_type == 1:
             frame_type_name = "MAC-FRAG" 
             additional_info['description'] = 'Fragment'
         elif frame_type == 2:
-            frame_type_name = "MAC-END"
-            additional_info['description'] = 'End of transmission'
-        elif frame_type == 3:
             frame_type_name = "MAC-BROADCAST"
             additional_info['description'] = 'Broadcast info'
-        elif frame_type == 4:
-            frame_type_name = "MAC-SUPPL"
-            additional_info['description'] = 'Supplementary'
-        elif frame_type == 5:
-            frame_type_name = "MAC-U-SIGNAL"
-            additional_info['description'] = 'Signaling'
-        elif frame_type == 6:
-            frame_type_name = "MAC-DATA"
-            additional_info['description'] = 'User Data'
-        elif frame_type == 7:
-            frame_type_name = "MAC-U-BLK"
-            additional_info['description'] = 'Block'
+        elif frame_type == 3:
+            # Type 3 is often MAC-END or MAC-U-SIGNAL depending on context
+            # For Downlink, 11 is often reserved or proprietary, or MAC-D-BLCK
+            frame_type_name = "MAC-END/RES"
+            additional_info['description'] = 'End/Reserved'
         else:
             frame_type_name = f"Type {frame_type}"
             additional_info['description'] = f'Raw type {frame_type}'
 
-        # Extract encryption indicator - be aggressive, assume encrypted unless proven clear
-        encrypted = True  # Default to encrypted
-        encryption_algorithm = 'TEA1'  # Default algorithm
+        # Extract encryption indicator
+        # Encryption Mode: 0=Clear, 1=SCK, 2=DCK, 3=Reserved
+        encrypted = encryption_mode_int > 0
+        encryption_algorithm = None
+        
+        if encryption_mode_int == 1:
+            encryption_algorithm = 'TEA1' # Default assumption for Class 2
+            additional_info['encryption_mode'] = 'Class 2 (SCK)'
+        elif encryption_mode_int == 2:
+            encryption_algorithm = 'TEA2' # Default assumption for Class 3
+            additional_info['encryption_mode'] = 'Class 3 (DCK)'
+        elif encryption_mode_int == 3:
+            encryption_algorithm = 'TEA3' # Assumption
+            additional_info['encryption_mode'] = 'Reserved'
+            
         key_id = '0'
         
         frame_data = {
@@ -731,9 +801,31 @@ class TetraDecoder:
                         if mac_pdu.encrypted:
                             encrypted = True
                             frame_data['encrypted'] = True
-                            if not encryption_algorithm:
+                            
+                            # Use encryption mode to hint algorithm
+                            # 0=Clear, 1=Class2(TEA1/2), 2=Class3(TEA2/3/4), 3=Reserved
+                            enc_mode = getattr(mac_pdu, 'encryption_mode', 0)
+                            
+                            if enc_mode == 1:
+                                # Class 2 - usually TEA1, sometimes TEA2
                                 encryption_algorithm = 'TEA1'
                                 frame_data['encryption_algorithm'] = 'TEA1'
+                                additional_info['encryption_mode'] = 'Class 2 (SCK)'
+                            elif enc_mode == 2:
+                                # Class 3 - usually TEA2, sometimes TEA3/4
+                                encryption_algorithm = 'TEA2'
+                                frame_data['encryption_algorithm'] = 'TEA2'
+                                additional_info['encryption_mode'] = 'Class 3 (DCK)'
+                            elif enc_mode == 3:
+                                # Reserved - assume TEA3/4
+                                encryption_algorithm = 'TEA3'
+                                frame_data['encryption_algorithm'] = 'TEA3'
+                                additional_info['encryption_mode'] = 'Reserved'
+                            else:
+                                # Default
+                                if not encryption_algorithm:
+                                    encryption_algorithm = 'TEA1'
+                                    frame_data['encryption_algorithm'] = 'TEA1'
                         else:
                             # Check data entropy
                             if len(mac_pdu.data) > 0:

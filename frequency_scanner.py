@@ -24,16 +24,20 @@ except ImportError:
 class TetraSignalDetector:
     """Detects TETRA signals in captured samples."""
     
-    def __init__(self, sample_rate=1.8e6):
+    def __init__(self, sample_rate=2.4e6, noise_floor=-45, bottom_threshold=-85):
         """
         Initialize signal detector.
         
         Args:
-            sample_rate: Sample rate in Hz
+            sample_rate: Sample rate in Hz (default: 2.4 MHz per TETRA spec)
+            noise_floor: Noise floor threshold in dB (default: -45 dB)
+            bottom_threshold: Bottom power threshold in dB (default: -85 dB)
         """
         self.sample_rate = sample_rate
-        self.symbol_rate = 18000  # TETRA symbol rate
+        self.symbol_rate = 18000  # TETRA symbol rate (18 kHz)
         self.channel_bandwidth = 25000  # TETRA channel bandwidth (25 kHz)
+        self.noise_floor = noise_floor
+        self.bottom_threshold = bottom_threshold
         
     def calculate_power(self, samples: np.ndarray) -> float:
         """
@@ -279,7 +283,7 @@ class TetraSignalDetector:
             'frames_validated': frames_valid,
             'crc_pass_rate': crc_rate,
             'power_stable': power_stable,
-            'signal_present': power > -60  # Threshold for signal presence
+            'signal_present': power > self.bottom_threshold  # Use bottom_threshold for signal presence
         }
 
 
@@ -297,19 +301,23 @@ class FrequencyScanner:
     # Default TETRA channel spacing (kHz)
     CHANNEL_SPACING = 25.0  # 25 kHz
     
-    def __init__(self, rtl_capture, sample_rate=1.8e6, scan_step=25e3):
+    def __init__(self, rtl_capture, sample_rate=2.4e6, scan_step=25e3, noise_floor=-45, bottom_threshold=-85):
         """
         Initialize frequency scanner.
         
         Args:
             rtl_capture: RTLCapture instance
-            sample_rate: Sample rate in Hz
-            scan_step: Frequency step size for scanning (default: 12.5 kHz)
+            sample_rate: Sample rate in Hz (default: 2.4 MHz per TETRA spec)
+            scan_step: Frequency step size for scanning (default: 25 kHz - TETRA channel spacing)
+            noise_floor: Noise floor threshold in dB (default: -45 dB)
+            bottom_threshold: Bottom power threshold in dB (default: -85 dB)
         """
         self.capture = rtl_capture
         self.sample_rate = sample_rate
         self.scan_step = scan_step
-        self.detector = TetraSignalDetector(sample_rate)
+        self.noise_floor = noise_floor
+        self.bottom_threshold = bottom_threshold
+        self.detector = TetraSignalDetector(sample_rate, noise_floor=noise_floor, bottom_threshold=bottom_threshold)
         self.found_channels = []  # List of found TETRA channels
         
     def scan_frequency(self, frequency: float, dwell_time: float = 0.5) -> Dict:

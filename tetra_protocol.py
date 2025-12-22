@@ -101,6 +101,7 @@ class MacPDU:
     length: int
     data: bytes
     fill_bits: int = 0
+    encryption_mode: int = 0  # 0=Clear, 1=Class2, 2=Class3, 3=Reserved
     reassembled_data: Optional[bytes] = None  # For fragmented messages
     
 
@@ -336,60 +337,92 @@ class TetraProtocolParser:
         if len(bits) < 8:
             return None
         
-        # MAC PDU Type (first 3 bits - simplified view)
-        # Note: Standard is 2 bits for DL, but we use 3 to map to our enum
-        pdu_type_val = (bits[0] << 2) | (bits[1] << 1) | bits[2]
-        try:
-            pdu_type = PDUType(pdu_type_val)
-        except ValueError:
-            pdu_type = PDUType.MAC_DATA
+        # MAC PDU Type (first 2 bits for Downlink)
+        # 00: MAC-RESOURCE
+        # 01: MAC-FRAG
+        # 10: MAC-BROADCAST
+        # 11: MAC-ENCRYPTED (or other, depending on context)
         
-        # Fill bit indicator
-        fill_bit_ind = bits[3]
+        pdu_type_int = (bits[0] << 1) | bits[1]
+        
+        # Map to internal Enum
+        if pdu_type_int == 0:
+            pdu_type = PDUType.MAC_RESOURCE
+        elif pdu_type_int == 1:
+            pdu_type = PDUType.MAC_FRAG
+        elif pdu_type_int == 2:
+            pdu_type = PDUType.MAC_BROADCAST
+        else:
+            # Type 3 is often MAC-END or MAC-U-SIGNAL depending on context/uplink/downlink
+            # For Downlink, 11 is often reserved or proprietary, or MAC-D-BLCK
+            # Let's assume MAC-END for now if it fits the structure
+            pdu_type = PDUType.MAC_END
+
+        # Encryption Mode (Bits 2-3)
+        # 00: Class 1 (Clear)
+        # 01: Class 2 (SCK)
+        # 10: Class 3 (DCK)
+        # 11: Reserved
+        encryption_mode_val = (bits[2] << 1) | bits[3]
+        encrypted = encryption_mode_val > 0
         
         # Default fields
-        encrypted = False
         address = None
         length = 0
         data_bytes = b''
+        fill_bit_ind = 0
         
         # Parse based on PDU Type
         if pdu_type == PDUType.MAC_RESOURCE:
-            # MAC-RESOURCE (Type 0)
-            # Structure: Type(3?), Fill(1), Encrypted(1), Address(24), Length(6), Data...
+            # MAC-RESOURCE
+            # Bits: Type(2), EncMode(2), Fill(1), ...
+            fill_bit_ind = bits[4]
             
-            encrypted = bool(bits[4])
+            # Position pointer
+            pos = 5
             
-            # Address (bits 5-28)
-            if len(bits) >= 29:
-                address_bits = bits[5:29]
+            # Encryption (already parsed mode)
+            
+            # Address (24 bits)
+            if len(bits) >= pos + 24:
+                address_bits = bits[pos:pos+24]
                 address = int(''.join(str(b) for b in address_bits), 2)
+                pos += 24
             
-            # Length (bits 29-35)
-            if len(bits) >= 35:
-                length_bits = bits[29:35]
+            # Length (6 bits)
+            if len(bits) >= pos + 6:
+                length_bits = bits[pos:pos+6]
                 length = int(''.join(str(b) for b in length_bits), 2)
+                pos += 6
                 
             # Data
-            data_start = 35
-            data_bits = bits[data_start:data_start + length * 8] if len(bits) > data_start else bits[data_start:]
+            # If length is 0, it might mean "rest of slot" or specific rule
+            # Standard says: Length indicator 000000 means Null PDU or similar?
+            # Actually, length is in octets (bytes) usually.
+            
+            data_len_bits = length * 8
+            if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
+                data_bits = bits[pos:pos + data_len_bits]
+            else:
+                data_bits = bits[pos:]
+                
             try:
                 data_bytes = BitArray(data_bits).tobytes()
             except:
                 data_bytes = b''
                 
             # Start fragmentation buffer
+            # Only start if this looks like the beginning of a message
             self.fragment_buffer = bytearray(data_bytes)
-            self.fragment_metadata = {'address': address, 'encrypted': encrypted}
+            self.fragment_metadata = {'address': address, 'encrypted': encrypted, 'mode': encryption_mode_val}
             
         elif pdu_type == PDUType.MAC_FRAG:
-            # MAC-FRAG (Type 1)
-            # Structure: Type(3?), Fill(1), Data... (No address/length/encryption header)
-            # It just continues the previous stream
+            # MAC-FRAG
+            # Bits: Type(2), EncMode(2), Fill(1), ...
+            fill_bit_ind = bits[4]
+            pos = 5
             
-            # Data starts immediately after Fill bit (bit 4)
-            data_start = 4
-            data_bits = bits[data_start:]
+            data_bits = bits[pos:]
             try:
                 data_bytes = BitArray(data_bits).tobytes()
             except:
@@ -398,48 +431,64 @@ class TetraProtocolParser:
             # Append to buffer
             self.fragment_buffer.extend(data_bytes)
             
-            # Restore metadata from RESOURCE frame
+            # Restore metadata
             if self.fragment_metadata:
                 encrypted = self.fragment_metadata.get('encrypted', False)
                 address = self.fragment_metadata.get('address')
             
-        elif pdu_type == PDUType.MAC_END:
-            # MAC-END (Type 2)
-            # Structure: Type(3?), Fill(1), Length(6?), Data...
+        elif pdu_type == PDUType.MAC_BROADCAST:
+            # MAC-BROADCAST
+            # Bits: Type(2), BroadcastType(2), ...
+            # BroadcastType: 00=SYSINFO, 01=ACCESS-DEFINE, ...
+            broadcast_type = (bits[2] << 1) | bits[3]
             
-            # Length (bits 4-10?) - Assuming similar structure to RESOURCE but no address
-            # Let's assume Length is present
-            if len(bits) >= 10:
-                length_bits = bits[4:10]
-                length = int(''.join(str(b) for b in length_bits), 2)
+            pos = 4
+            # SYSINFO (Type 0)
+            if broadcast_type == 0:
+                # Parse SYSINFO elements
+                # MCC(10), MNC(14), CC(6), ...
+                if len(bits) >= pos + 30:
+                    self.mcc = int(''.join(str(b) for b in bits[pos:pos+10]), 2)
+                    self.mnc = int(''.join(str(b) for b in bits[pos+10:pos+24]), 2)
+                    self.colour_code = int(''.join(str(b) for b in bits[pos+24:pos+30]), 2)
+            
+            data_bits = bits[pos:]
+            try:
+                data_bytes = BitArray(data_bits).tobytes()
+            except:
+                data_bytes = b''
                 
-                data_start = 10
-                data_bits = bits[data_start:data_start + length * 8] if len(bits) > data_start else bits[data_start:]
-                try:
-                    data_bytes = BitArray(data_bits).tobytes()
-                except:
-                    data_bytes = b''
+        else:
+            # Fallback / MAC-END
+            # Bits: Type(2), EncMode(2), Fill(1), Length(6)?
+            # MAC-END usually has structure: Type(2), EncMode(2), Fill(1), Length(6)
+            fill_bit_ind = bits[4]
+            pos = 5
+            
+            # Assuming Length is present for MAC-END
+            if len(bits) >= pos + 6:
+                length_bits = bits[pos:pos+6]
+                length = int(''.join(str(b) for b in length_bits), 2)
+                pos += 6
+                
+            data_len_bits = length * 8
+            if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
+                data_bits = bits[pos:pos + data_len_bits]
             else:
+                data_bits = bits[pos:]
+                
+            try:
+                data_bytes = BitArray(data_bits).tobytes()
+            except:
                 data_bytes = b''
                 
             # Append and Finalize
             self.fragment_buffer.extend(data_bytes)
             
-        else:
-            # Other types (Broadcast, etc) - Use generic parsing (legacy)
-            encrypted = bool(bits[4])
-            if len(bits) >= 29:
-                address_bits = bits[5:29]
-                address = int(''.join(str(b) for b in address_bits), 2)
-            if len(bits) >= 35:
-                length_bits = bits[29:35]
-                length = int(''.join(str(b) for b in length_bits), 2)
-            data_start = 35
-            data_bits = bits[data_start:data_start + length * 8] if len(bits) > data_start else bits[data_start:]
-            try:
-                data_bytes = BitArray(data_bits).tobytes()
-            except:
-                data_bytes = b''
+            # Restore metadata
+            if self.fragment_metadata:
+                encrypted = self.fragment_metadata.get('encrypted', False)
+                address = self.fragment_metadata.get('address')
 
         if encrypted:
             self.stats['encrypted_frames'] += 1
@@ -453,30 +502,43 @@ class TetraProtocolParser:
             address=address,
             length=length,
             data=data_bytes,
-            fill_bits=fill_bit_ind
+            fill_bits=fill_bit_ind,
+            encryption_mode=encryption_mode_val
         )
         
         # Attach reassembled data if this is the end
-        if pdu_type == PDUType.MAC_END and self.fragment_buffer:
-            pdu.reassembled_data = bytes(self.fragment_buffer)
-            # Restore metadata from start frame
-            if self.fragment_metadata:
-                if not pdu.address: pdu.address = self.fragment_metadata.get('address')
-                # Restore encryption status from RESOURCE frame
-                if not encrypted:
-                    encrypted = self.fragment_metadata.get('encrypted', False)
-                    pdu.encrypted = encrypted
-            
-            logger.debug(f"Reassembled {len(pdu.reassembled_data)} bytes from fragments")
-            
-            # Clear buffer
-            self.fragment_buffer = bytearray()
-            self.fragment_metadata = {}
+        # Logic:
+        # 1. MAC-RESOURCE with full length (no fragmentation) -> Single packet
+        # 2. MAC-END -> End of fragmentation chain
         
-        # For FRAG frames, also include current buffer state for monitoring
-        elif pdu_type == PDUType.MAC_FRAG and self.fragment_buffer:
-            # Don't set reassembled_data yet, but we could log progress
-            logger.debug(f"Fragment buffer now has {len(self.fragment_buffer)} bytes")
+        # Check if MAC-RESOURCE is self-contained (not fragmented)
+        # Usually indicated by a flag or context, but here we assume if it's MAC-RESOURCE
+        # and we don't see a "More Bit" (which we haven't parsed yet), it might be single.
+        # BUT, standard says MAC-RESOURCE starts a transaction.
+        # If we treat every MAC-RESOURCE as start of buffer, and MAC-END as end.
+        
+        if pdu_type == PDUType.MAC_END:
+             if self.fragment_buffer:
+                pdu.reassembled_data = bytes(self.fragment_buffer)
+                if self.fragment_metadata:
+                    if not pdu.address: pdu.address = self.fragment_metadata.get('address')
+                    # Inherit encryption from start of chain
+                    pdu.encrypted = self.fragment_metadata.get('encrypted', False)
+                
+                # Clear buffer
+                self.fragment_buffer = bytearray()
+                self.fragment_metadata = {}
+        
+        elif pdu_type == PDUType.MAC_RESOURCE:
+            # If this is a single-slot message (no fragmentation), we should treat it as such.
+            # However, without parsing the "More Bit" (TM-SDU header), we can't be sure.
+            # Heuristic: If length is small enough to fit in slot and we don't see MAC-FRAG next...
+            # Better: Always expose current data, but also expose reassembled if MAC-END.
+            # For MAC-RESOURCE, we just started the buffer. If it's a short message, 
+            # it might be the whole message.
+            # Let's tentatively set reassembled_data to current data for MAC-RESOURCE
+            # so single-frame messages work.
+            pdu.reassembled_data = bytes(data_bytes)
             
         return pdu
     def parse_call_metadata(self, mac_pdu: MacPDU) -> Optional[CallMetadata]:
@@ -529,12 +591,29 @@ class TetraProtocolParser:
         # Usually in the lower bits of byte 6 and upper of byte 7
         call_identifier = ((data[6] & 0x0F) << 10) | (data[7] << 2) # Rough guess
         
+        # Try to find Source SSI (Calling Party) in the payload (TM-SDU)
+        # This is a heuristic search for a 24-bit SSI that is NOT the talkgroup
+        source_ssi = None
+        if len(data) > 10:
+            # Scan for potential SSIs (3 bytes)
+            # Valid SSI range: 1 - 16777215 (0 is reserved, >16M is reserved/short)
+            # We skip the first few bytes which are MAC header
+            for i in range(8, len(data) - 3):
+                val = int.from_bytes(data[i:i+3], 'big') & 0xFFFFFF
+                # Heuristic: SSI should be different from TG, and look "reasonable"
+                # Most user SSIs are > 1000 and < 16000000
+                if val != talkgroup_id and 1000 < val < 16000000:
+                    # Check if it looks like a valid SSI (not all FFs or 00s)
+                    if val != 0xFFFFFF and val != 0:
+                        source_ssi = val
+                        break
+        
         self.stats['control_messages'] += 1
         
         return CallMetadata(
             call_type=call_type,
             talkgroup_id=talkgroup_id,
-            source_ssi=None,
+            source_ssi=source_ssi,
             dest_ssi=None,
             channel_allocated=channel_allocated,
             call_identifier=call_identifier,

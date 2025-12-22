@@ -58,6 +58,7 @@ class VoiceProcessor:
             # Log input data stats
             input_shorts = np.frombuffer(frame_data, dtype=np.int16)
             logger.debug(f"Codec input: {len(input_shorts)} shorts, Max: {np.max(np.abs(input_shorts))}, Header: 0x{input_shorts[0]:04X}")
+            logger.debug(f"Codec input file: {tmp_in_path}")
             
             logger.debug(f"Calling codec: {self.codec_path} {tmp_in_path} {tmp_out_path}")
             
@@ -80,16 +81,20 @@ class VoiceProcessor:
                           check=False,
                           timeout=5)
             
+            # Log codec process output
+            if result.stdout:
+                logger.debug(f"Codec STDOUT: {result.stdout.decode('utf-8', errors='ignore').strip()}")
+            if result.stderr:
+                logger.debug(f"Codec STDERR: {result.stderr.decode('utf-8', errors='ignore').strip()}")
+            
             if result.returncode != 0:
                 logger.debug(f"Codec failed with return code {result.returncode}")
-                if result.stderr:
-                    logger.debug(f"Codec stderr: {result.stderr.decode('utf-8', errors='ignore')}")
-                if result.stdout:
-                    logger.debug(f"Codec stdout: {result.stdout.decode('utf-8', errors='ignore')}")
             
             # Read output
             if os.path.exists(tmp_out_path) and os.path.getsize(tmp_out_path) > 0:
                 output_size = os.path.getsize(tmp_out_path)
+                logger.debug(f"Codec output file: {tmp_out_path} ({output_size} bytes)")
+                
                 with open(tmp_out_path, 'rb') as f:
                     pcm_data = f.read()
                 
@@ -112,8 +117,9 @@ class VoiceProcessor:
                     
                     # Cleanup
                     try:
-                        os.remove(tmp_in_path)
-                        os.remove(tmp_out_path)
+                        # os.remove(tmp_in_path)
+                        # os.remove(tmp_out_path)
+                        pass
                     except:
                         pass
                     
@@ -127,25 +133,23 @@ class VoiceProcessor:
                         logger.debug(f"Decoded {len(audio)} audio samples (partial)")
                         # Cleanup
                         try:
-                            os.remove(tmp_in_path)
-                            os.remove(tmp_out_path)
+                            # os.remove(tmp_in_path)
+                            # os.remove(tmp_out_path)
+                            pass
                         except:
                             pass
                         return audio
                 
                 # Cleanup if no valid audio
                 try:
-                    os.remove(tmp_in_path)
-                    os.remove(tmp_out_path)
+                    # os.remove(tmp_in_path)
+                    # os.remove(tmp_out_path)
+                    pass
                 except:
                     pass
                 return np.zeros(0)
             else:
-                # Check stderr for errors
-                if result.stderr:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')[:200]
-                    logger.debug(f"Codec error: {error_msg}")
-                logger.debug(f"Codec produced no output (return code: {result.returncode})")
+                logger.debug(f"Codec produced no output file or empty file (return code: {result.returncode})")
                 try:
                     os.remove(tmp_in_path)
                     if os.path.exists(tmp_out_path):

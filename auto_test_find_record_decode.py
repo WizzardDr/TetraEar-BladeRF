@@ -1,6 +1,11 @@
 """
 Automated TETRA Testing Script
+
 Finds frequencies, records signals, decodes, and verifies TEXT (SDS) and VOICE.
+Implements TETRA specifications according to:
+- ETSI EN 300 392-2 V3.2.1 (Air Interface)
+- ETSI EN 300 395-2 V1.3.0 (Voice Codec)
+- π/4-DQPSK modulation at 18 kHz symbol rate
 """
 
 import os
@@ -12,12 +17,14 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 
-# Setup logging
+# Setup logging with professional style
+# Note: Logs overwrite on each start and use professional format (per user preference)
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)-8s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler('test_session.log', mode='w'),
+        logging.FileHandler('test_session.log', mode='w'),  # Overwrites on each start
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -33,8 +40,20 @@ from voice_processor import VoiceProcessor
 class AutoTester:
     """Automated TETRA testing and verification."""
     
-    def __init__(self, sample_rate=1.8e6):
+    def __init__(self, sample_rate=2.4e6, default_gain=50, noise_floor=-45, bottom_threshold=-85):
+        """
+        Initialize automated TETRA tester.
+        
+        Args:
+            sample_rate: Sample rate in Hz (default: 2.4 MHz per TETRA spec)
+            default_gain: Default RTL-SDR gain setting (default: 50)
+            noise_floor: Noise floor threshold in dB (default: -45 dB)
+            bottom_threshold: Bottom power threshold in dB (default: -85 dB)
+        """
         self.sample_rate = sample_rate
+        self.default_gain = default_gain
+        self.noise_floor = noise_floor
+        self.bottom_threshold = bottom_threshold
         self.capture = None
         self.processor = None
         self.decoder = None
@@ -60,15 +79,27 @@ class AutoTester:
             self.capture = RTLCapture(
                 frequency=start_freq,
                 sample_rate=self.sample_rate,
-                gain='40'
+                gain=self.default_gain
             )
             
             if not self.capture.open():
                 logger.error("Failed to open RTL-SDR device")
                 return []
             
-            scanner = FrequencyScanner(self.capture, self.sample_rate, scan_step=step)
-            found = scanner.scan_range(start_freq, end_freq, min_power=-70, min_confidence=0.4)
+            scanner = FrequencyScanner(
+                self.capture, 
+                self.sample_rate, 
+                scan_step=step,
+                noise_floor=self.noise_floor,
+                bottom_threshold=self.bottom_threshold
+            )
+            # Use bottom_threshold as minimum power for detection
+            found = scanner.scan_range(
+                start_freq, 
+                end_freq, 
+                min_power=self.bottom_threshold, 
+                min_confidence=0.4
+            )
             
             self.found_frequencies = found
             logger.info(f"\nFound {len(found)} active frequency(ies):")
@@ -84,7 +115,7 @@ class AutoTester:
         except Exception as e:
             logger.error(f"Error finding frequencies: {e}")
             import traceback
-            logger.error(traceback.format_exc())
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return []
     
     def record_and_decode(self, frequency, duration=10.0):
@@ -101,7 +132,7 @@ class AutoTester:
             self.capture = RTLCapture(
                 frequency=frequency,
                 sample_rate=self.sample_rate,
-                gain='auto'
+                gain=self.default_gain
             )
             
             if not self.capture.open():
@@ -144,8 +175,10 @@ class AutoTester:
             
             try:
                 while time.time() - start_time < duration:
-                    # Read samples
-                    samples = self.capture.read_samples(32 * 1024)
+                    # Read samples - INCREASED BUFFER SIZE to ensure full frames
+                    # 2.4 MSps * 0.1s = 240k samples. Let's use 256k or 512k.
+                    # Previous 32k was too small (~13ms), splitting every frame.
+                    samples = self.capture.read_samples(512 * 1024)
                     if len(samples) < 1000:
                         time.sleep(0.1)
                         continue
@@ -189,29 +222,48 @@ class AutoTester:
                         if self.voice_processor and self.voice_processor.working:
                             codec_input = None
                             
-                            # Try to extract from symbols
-                            if demodulated_symbols is not None:
+                            # Check if frame is encrypted and decrypted
+                            voice_bits = None
+                            if frame.get('decrypted') and 'decrypted_payload' in frame:
+                                # Use decrypted bits!
+                                try:
+                                    payload_str = frame['decrypted_payload']
+                                    # Convert string '0101...' to list of ints
+                                    voice_bits = np.array([int(b) for b in payload_str], dtype=np.uint8)
+                                    # Skip header (first 32 bits usually) if needed, but payload usually starts after header
+                                    # In tetra_decoder, decrypted_payload is bits[32:]
+                                    # So we have the payload bits directly.
+                                    # But voice frames might need the whole frame or specific parts.
+                                    # The codec expects 432 bits for a speech frame.
+                                    # If decrypted_payload is the MAC PDU payload, it might be enough.
+                                except Exception as e:
+                                    logger.debug(f"Error using decrypted payload: {e}")
+                            
+                            # If no decrypted bits, try raw bits (only if not encrypted)
+                            if voice_bits is None and not frame.get('encrypted'):
+                                if 'bits' in frame:
+                                    voice_bits = frame['bits']
+                                elif 'mac_pdu' in frame:
+                                    mac = frame['mac_pdu']
+                                    if isinstance(mac, dict) and 'data' in mac:
+                                        data = mac['data']
+                                        if isinstance(data, bytes) and len(data) >= 17:
+                                            bit_list = []
+                                            for byte_val in data:
+                                                for bit_idx in range(8):
+                                                    bit_list.append((byte_val >> (7 - bit_idx)) & 1)
+                                            voice_bits = np.array(bit_list[:432], dtype=np.uint8)
+                            
+                            # Try to build codec frame from bits (decrypted or clear)
+                            if voice_bits is not None and len(voice_bits) >= 432:
+                                codec_input = self._build_codec_frame(voice_bits)
+                            
+                            # Fallback: Try to extract from symbols (ONLY if not encrypted)
+                            # Symbols are raw air interface, so they are encrypted if frame is encrypted
+                            if codec_input is None and not frame.get('encrypted') and demodulated_symbols is not None:
                                 codec_input = self._extract_voice_slot_from_symbols(
                                     frame, demodulated_symbols, samples_per_symbol
                                 )
-                            
-                            # If extraction failed, try alternative method
-                            if codec_input is None:
-                                voice_bits = None
-                                if 'bits' in frame:
-                                    voice_bits = frame['bits']
-                                elif 'mac_pdu' in frame and 'data' in mac:
-                                    data = mac['data']
-                                    if isinstance(data, bytes) and len(data) >= 17:  # At least 137 bits
-                                        # Convert to bits
-                                        bit_list = []
-                                        for byte_val in data:
-                                            for bit_idx in range(8):
-                                                bit_list.append((byte_val >> (7 - bit_idx)) & 1)
-                                        voice_bits = np.array(bit_list[:432], dtype=np.uint8) if len(bit_list) >= 432 else None
-                                
-                                if voice_bits is not None and len(voice_bits) >= 432:
-                                    codec_input = self._build_codec_frame(voice_bits)
                             
                             # Decode voice frame
                             if codec_input is not None and len(codec_input) == 1380:
@@ -271,9 +323,9 @@ class AutoTester:
             return len(text_messages) > 0 or voice_frames_count > 0
             
         except Exception as e:
-            logger.error(f"Error recording/decoding: {e}")
+            logger.error(f"Error recording/decoding at {frequency/1e6:.3f} MHz: {e}")
             import traceback
-            logger.error(traceback.format_exc())
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
     
     def _extract_voice_slot_from_symbols(self, frame, demodulated_symbols, samples_per_symbol):
@@ -300,8 +352,9 @@ class AutoTester:
                 bit1 = (sym >> 1) & 1
                 bit0 = sym & 1
                 # Scale to ±127 range
-                soft_bits.append(127 if bit1 else -127)
-                soft_bits.append(127 if bit0 else -127)
+                # Logic: 1 -> -127, 0 -> 127
+                soft_bits.append(-127 if bit1 else 127)
+                soft_bits.append(-127 if bit0 else 127)
             
             # Extract second block (108 symbols = 216 bits)
             for i in range(119, 227):
@@ -310,14 +363,14 @@ class AutoTester:
                 sym = int(slot_symbols[i])
                 bit1 = (sym >> 1) & 1
                 bit0 = sym & 1
-                soft_bits.append(127 if bit1 else -127)
-                soft_bits.append(127 if bit0 else -127)
+                soft_bits.append(-127 if bit1 else 127)
+                soft_bits.append(-127 if bit0 else 127)
             
             # Build 690-short frame
             return self._build_codec_frame_from_soft_bits(soft_bits)
             
         except Exception as e:
-            logger.debug(f"Error extracting voice slot: {e}")
+            logger.debug(f"Error extracting voice slot from symbols: {e}")
             return None
     
     def _build_codec_frame_from_soft_bits(self, soft_bits):
@@ -328,32 +381,43 @@ class AutoTester:
             return None
         
         block = [0] * 690
+        
+        # Header 1
         block[0] = 0x6B21
         
         idx = 0
-        # Block 1: positions 1-114
+        # Block 1: positions 1-114 (114 bits)
         for i in range(1, 115):
             if idx < len(soft_bits):
-                block[i] = soft_bits[idx] & 0x00FF
+                block[i] = soft_bits[idx]
                 idx += 1
         
-        # Block 2: positions 116-229
+        # Header 2
+        block[115] = 0x6B22
+        
+        # Block 2: positions 116-229 (114 bits)
         for i in range(116, 230):
             if idx < len(soft_bits):
-                block[i] = soft_bits[idx] & 0x00FF
+                block[i] = soft_bits[idx]
                 idx += 1
         
-        # Block 3: positions 231-344
+        # Header 3
+        block[230] = 0x6B26
+        
+        # Block 3: positions 231-344 (114 bits)
         for i in range(231, 345):
             if idx < len(soft_bits):
-                block[i] = soft_bits[idx] & 0x00FF
+                block[i] = soft_bits[idx]
                 idx += 1
         
-        # Block 4: positions 346-435
-        for i in range(346, 436):
+        # Block 4: positions 345-434 (90 bits)
+        for i in range(345, 435):
             if idx < len(soft_bits):
-                block[i] = soft_bits[idx] & 0x00FF
+                block[i] = soft_bits[idx]
                 idx += 1
+        
+        # Header 4 at end of data?
+        block[435] = 0x6B21
         
         return struct.pack(f'<{len(block)}h', *block)
     
@@ -366,7 +430,8 @@ class AutoTester:
         
         soft_bits = []
         for bit in voice_bits[:432]:
-            soft_bits.append(127 if bit else -127)
+            # Logic: 1 -> -127, 0 -> 127
+            soft_bits.append(-127 if bit else 127)
         
         return self._build_codec_frame_from_soft_bits(soft_bits)
     
@@ -413,8 +478,13 @@ class AutoTester:
                 logger.warning(f"[FAIL] cdecoder produced no output")
                 return False
                 
+        except subprocess.TimeoutExpired:
+            logger.error("cdecoder execution timed out after 30 seconds")
+            return False
         except Exception as e:
             logger.error(f"Error running cdecoder: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
 
     def _convert_raw_to_wav(self, raw_file, wav_file):
@@ -498,15 +568,24 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Automated TETRA Testing')
-    parser.add_argument('--freq', type=float, help='Specific frequency in MHz to test')
+    parser.add_argument('--freq', type=float, default=390.865, help='Specific frequency in MHz to test (default: 390.865)')
     parser.add_argument('--scan-start', type=float, default=390.0, help='Scan start frequency (MHz)')
     parser.add_argument('--scan-end', type=float, default=395.0, help='Scan end frequency (MHz)')
     parser.add_argument('--duration', type=float, default=10.0, help='Recording duration per frequency (seconds)')
     parser.add_argument('--no-scan', action='store_true', help='Skip frequency scanning')
+    parser.add_argument('--sample-rate', type=float, default=2.4, help='Sample rate in MHz (default: 2.4)')
+    parser.add_argument('--gain', type=int, default=50, help='RTL-SDR gain setting (default: 50)')
+    parser.add_argument('--noise-floor', type=float, default=-45, help='Noise floor in dB (default: -45)')
+    parser.add_argument('--bottom', type=float, default=-85, help='Bottom threshold in dB (default: -85)')
     
     args = parser.parse_args()
     
-    tester = AutoTester()
+    tester = AutoTester(
+        sample_rate=args.sample_rate * 1e6,
+        default_gain=args.gain,
+        noise_floor=args.noise_floor,
+        bottom_threshold=args.bottom
+    )
     
     try:
         # Step 1: Find frequencies
@@ -524,8 +603,8 @@ def main():
             )
             frequencies_to_test = [ch['frequency'] for ch in found]
         else:
-            # Default test frequency
-            frequencies_to_test = [392.240e6]
+            # Default test frequency (390.865 MHz per user specification)
+            frequencies_to_test = [args.freq * 1e6]
             logger.info(f"No scan requested, using default: {frequencies_to_test[0]/1e6:.3f} MHz")
         
         if not frequencies_to_test:

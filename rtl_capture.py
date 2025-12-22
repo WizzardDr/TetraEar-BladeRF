@@ -50,7 +50,14 @@ class RTLCapture:
             self.sdr = RtlSdr()
             self.sdr.sample_rate = self.sample_rate
             self.sdr.center_freq = self.frequency
-            self.sdr.gain = self.gain
+            # Handle gain: 'auto' stays as string, numeric values should be numeric
+            if isinstance(self.gain, str) and self.gain.lower() == 'auto':
+                self.sdr.gain = 'auto'
+            elif isinstance(self.gain, str) and self.gain.isdigit():
+                # Convert string numeric value to float/int
+                self.sdr.gain = float(self.gain)
+            else:
+                self.sdr.gain = self.gain
             try:
                 self.sdr.set_bias_tee(False)
             except AttributeError:

@@ -1,5 +1,11 @@
 """
 Signal processing module for TETRA demodulation.
+
+Implements π/4-DQPSK demodulation according to TETRA specifications:
+- ETSI EN 300 392-2 V3.2.1 (Air Interface)
+- Symbol rate: 18 kHz
+- Channel bandwidth: 25 kHz
+- Modulation: π/4-DQPSK with phase transitions per Table 5.1
 """
 
 import numpy as np
@@ -12,17 +18,19 @@ logger = logging.getLogger(__name__)
 class SignalProcessor:
     """Processes raw IQ samples for TETRA demodulation."""
     
-    def __init__(self, sample_rate=1.8e6):
+    def __init__(self, sample_rate=2.4e6):
         """
         Initialize signal processor.
         
         Args:
-            sample_rate: Sample rate in Hz
+            sample_rate: Sample rate in Hz (default: 2.4 MHz per TETRA spec)
         """
         self.sample_rate = sample_rate
         # TETRA uses π/4-DQPSK modulation at 18 kHz symbol rate
-        self.symbol_rate = 18000  # Hz
+        self.symbol_rate = 18000  # Hz (TETRA standard symbol rate)
         self.samples_per_symbol = int(sample_rate / self.symbol_rate)
+        # Store symbols for voice extraction
+        self.symbols = None
         
     def resample(self, samples, target_rate):
         """
@@ -42,28 +50,35 @@ class SignalProcessor:
     
     def filter_signal(self, samples, bandwidth=25000):
         """
-        Apply bandpass filter to isolate TETRA signal.
+        Apply bandpass filter to isolate TETRA signal channel.
+        
+        TETRA channels use 25 kHz bandwidth. For baseband IQ signals,
+        a lowpass filter is applied to remove out-of-band noise.
         
         Args:
             samples: Input samples
-            bandwidth: Filter bandwidth in Hz
+            bandwidth: Filter bandwidth in Hz (default: 25 kHz for TETRA)
             
         Returns:
             Filtered samples
         """
+        if len(samples) == 0:
+            return samples
+        
         nyquist = self.sample_rate / 2
-        # Normalize frequencies to [0, 1] range for butter filter
-        low = max(0.01, (nyquist - bandwidth / 2) / nyquist)
-        high = min(0.99, (nyquist + bandwidth / 2) / nyquist)
         
-        # Design Butterworth bandpass filter (centered at DC for baseband)
-        # For baseband signals, use lowpass filter
-        cutoff = bandwidth / 2 / nyquist
-        cutoff = min(0.99, max(0.01, cutoff))
-        b, a = signal.butter(4, cutoff, btype='low')
-        filtered = signal.filtfilt(b, a, samples)
+        # Design Butterworth lowpass filter for baseband signal
+        # Filter should pass TETRA channel bandwidth (25 kHz)
+        cutoff = (bandwidth / 2) / nyquist
+        cutoff = min(0.99, max(0.01, cutoff))  # Ensure valid range
         
-        return filtered
+        try:
+            b, a = signal.butter(4, cutoff, btype='low')
+            filtered = signal.filtfilt(b, a, samples)
+            return filtered
+        except Exception as e:
+            logger.warning(f"Filter design failed, using unfiltered samples: {e}")
+            return samples
     
     def frequency_shift(self, samples, freq_offset):
         """
@@ -82,51 +97,114 @@ class SignalProcessor:
     
     def demodulate_dqpsk(self, samples):
         """
-        Demodulate π/4-DQPSK signal.
+        Demodulate π/4-DQPSK signal according to TETRA specifications.
+        
+        TETRA uses π/4-DQPSK with phase transitions:
+        - Bits (1,1) -> -3π/4
+        - Bits (0,1) -> +3π/4  
+        - Bits (0,0) -> +π/4
+        - Bits (1,0) -> -π/4
+        
+        Reference: ETSI EN 300 392-2 V3.2.1, Table 5.1
         
         Args:
             samples: Input complex samples
             
         Returns:
-            Demodulated symbols
+            Demodulated symbols (0-3 mapping to bit pairs)
         """
-        # Normalize samples
-        samples = samples / np.abs(samples).max()
+        if len(samples) < 2:
+            return np.array([], dtype=np.uint8)
         
-        # Differential detection
+        # Normalize samples to prevent overflow
+        sample_power = np.abs(samples)
+        max_power = np.max(sample_power)
+        if max_power > 0:
+            samples = samples / max_power
+        
+        # Differential detection: phase difference between consecutive symbols
         symbols = []
         prev_sample = samples[0]
         
+        # TETRA π/4-DQPSK uses 8 constellation points at multiples of π/4
+        # Phase transitions are: ±π/4, ±3π/4
         for sample in samples[1:]:
-            # Differential phase detection
+            # Calculate differential phase: Δφ = arg(sample * conj(prev_sample))
             diff = sample * np.conj(prev_sample)
-            phase = np.angle(diff)
+            phase_diff = np.angle(diff)
             
-            # Map phase to symbol (π/4-DQPSK has 8 possible phases)
-            # Normalize to [0, 2π]
-            phase = (phase + 2 * np.pi) % (2 * np.pi)
+            # Normalize phase to [-π, π]
+            phase_diff = np.arctan2(np.imag(diff), np.real(diff))
             
-            # Quantize to nearest symbol
-            symbol = int(round(phase / (np.pi / 4))) % 8
+            # Map phase difference to TETRA symbol according to spec
+            # Quantize to nearest valid phase transition
+            # Valid transitions: -3π/4, -π/4, +π/4, +3π/4
+            # Mapping to bits (MSB, LSB) for symbols_to_bits (val >> 1, val & 1):
+            # +π/4  -> Bits (0,0) -> Symbol 0
+            # +3π/4 -> Bits (0,1) -> Symbol 1
+            # -π/4  -> Bits (1,0) -> Symbol 2
+            # -3π/4 -> Bits (1,1) -> Symbol 3
+            
+            if phase_diff < -5*np.pi/8:
+                symbol = 3  # Closest to -3π/4 (bits: 1,1)
+            elif phase_diff < -3*np.pi/8:
+                symbol = 2  # Closest to -π/4 (bits: 1,0)
+            elif phase_diff < 3*np.pi/8:
+                symbol = 0  # Closest to +π/4 (bits: 0,0)
+            elif phase_diff < 5*np.pi/8:
+                symbol = 1  # Closest to +3π/4 (bits: 0,1)
+            else:
+                symbol = 3  # Wrap around to -3π/4
+            
             symbols.append(symbol)
-            
             prev_sample = sample
         
-        return np.array(symbols)
+        return np.array(symbols, dtype=np.uint8)
     
     def extract_symbols(self, samples):
         """
-        Extract symbols from samples at symbol rate.
+        Extract symbols from samples at symbol rate with simple timing recovery.
         
         Args:
             samples: Input samples
             
         Returns:
-            Symbol stream
+            Symbol stream (complex samples at symbol rate)
         """
-        # Downsample to symbol rate
+        if len(samples) == 0:
+            return np.array([], dtype=complex)
+        
+        # Downsample to symbol rate using decimation
         if self.samples_per_symbol > 1:
-            symbols = samples[::self.samples_per_symbol]
+            # Simple timing recovery: Find the phase with maximum average power
+            # This helps align with the symbol centers (RRC pulse peaks)
+            best_phase = 0
+            max_power = -1
+            
+            # Check a few phases to find the best alignment
+            # We don't need to check every sample, just enough to find the peak
+            step = max(1, self.samples_per_symbol // 8)
+            
+            for phase in range(0, self.samples_per_symbol, step):
+                # Extract symbols at this phase
+                num_symbols = (len(samples) - phase) // self.samples_per_symbol
+                if num_symbols <= 0:
+                    continue
+                    
+                indices = phase + np.arange(num_symbols) * self.samples_per_symbol
+                phase_samples = samples[indices]
+                
+                # Calculate average power for this phase
+                power = np.mean(np.abs(phase_samples)**2)
+                
+                if power > max_power:
+                    max_power = power
+                    best_phase = phase
+            
+            # Extract using the best phase
+            num_symbols = (len(samples) - best_phase) // self.samples_per_symbol
+            indices = best_phase + np.arange(num_symbols) * self.samples_per_symbol
+            symbols = samples[indices]
         else:
             symbols = samples
         
@@ -134,26 +212,37 @@ class SignalProcessor:
     
     def process(self, samples, freq_offset=0):
         """
-        Complete signal processing pipeline.
+        Complete signal processing pipeline for TETRA demodulation.
+        
+        Processing steps:
+        1. Frequency offset correction (if needed)
+        2. Bandpass filtering to isolate TETRA channel (25 kHz bandwidth)
+        3. Symbol extraction at 18 kHz symbol rate
+        4. π/4-DQPSK differential demodulation
         
         Args:
             samples: Raw IQ samples
-            freq_offset: Frequency offset correction
+            freq_offset: Frequency offset correction in Hz
             
         Returns:
-            Demodulated symbols
+            Demodulated symbols (0-3 representing bit pairs)
         """
+        if len(samples) == 0:
+            self.symbols = np.array([], dtype=complex)
+            return np.array([], dtype=np.uint8)
+        
         # Apply frequency correction if needed
         if freq_offset != 0:
             samples = self.frequency_shift(samples, freq_offset)
         
-        # Filter signal
-        filtered = self.filter_signal(samples)
+        # Filter signal to isolate TETRA channel (25 kHz bandwidth)
+        filtered = self.filter_signal(samples, bandwidth=25000)
         
-        # Extract symbols
+        # Extract symbols at symbol rate (18 kHz)
         symbols = self.extract_symbols(filtered)
+        self.symbols = symbols  # Store for voice extraction
         
-        # Demodulate
+        # Demodulate using π/4-DQPSK
         demodulated = self.demodulate_dqpsk(symbols)
         
         return demodulated

@@ -19,6 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+logs/
+records/
+tetra_codec/
 
 # Virtual environments
 venv/
@@ -44,6 +47,9 @@ ENV/
 !keys.example.txt
 !test_input_*.txt
 !test_input_*.bin
+
+# Codec build artifacts
+.codecbuild/
 
 # OS
 .DS_Store

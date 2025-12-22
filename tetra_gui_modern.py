@@ -10,6 +10,21 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+import os
+
+# Configure logging
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"tetra_decoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +53,196 @@ from frequency_scanner import FrequencyScanner
 from voice_processor import VoiceProcessor
 
 
+import json
+
+class SettingsManager:
+    """Manage application settings."""
+    
+    DEFAULT_SETTINGS = {
+        "save_silence": False,
+        "auto_decrypt": False,
+        "monitor_audio": False,
+        "monitor_raw": False,
+        "gain": 50.0,
+        "sample_rate": 2.4e6,
+        "last_frequency": 390.865,
+        "bandwidth": 25000,
+        "zoom_level": 1.0,
+        "noise_floor": -85,
+        "theme": "dark"
+    }
+    
+    def __init__(self, filename="settings.json"):
+        self.filename = os.path.join(os.path.dirname(__file__), filename)
+        self.settings = self.DEFAULT_SETTINGS.copy()
+        self.load()
+        
+    def load(self):
+        """Load settings from file."""
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r') as f:
+                    loaded = json.load(f)
+                    self.settings.update(loaded)
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+            
+    def save(self):
+        """Save settings to file."""
+        try:
+            with open(self.filename, 'w') as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+            
+    def get(self, key, default=None):
+        return self.settings.get(key, default)
+        
+    def set(self, key, value):
+        self.settings[key] = value
+
+class FrequencyManager:
+    """Manage saved frequencies."""
+    
+    def __init__(self, filename="frequencies.json"):
+        self.filename = os.path.join(os.path.dirname(__file__), filename)
+        self.frequencies = []
+        self.load()
+        
+    def load(self):
+        """Load frequencies from file."""
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r') as f:
+                    self.frequencies = json.load(f)
+            else:
+                # Defaults
+                self.frequencies = [
+                    {"freq": 390.000, "label": "TETRA PL 1", "desc": "Poland Public Safety"},
+                    {"freq": 392.500, "label": "TETRA PL 2", "desc": "Poland Public Safety"},
+                    {"freq": 420.000, "label": "TETRA EU", "desc": "Europe General"},
+                ]
+        except Exception as e:
+            logger.error(f"Failed to load frequencies: {e}")
+            
+    def save(self):
+        """Save frequencies to file."""
+        try:
+            with open(self.filename, 'w') as f:
+                json.dump(self.frequencies, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save frequencies: {e}")
+            
+    def add(self, freq, label, desc=""):
+        self.frequencies.append({"freq": freq, "label": label, "desc": desc})
+        self.save()
+        
+    def get_all(self):
+        return self.frequencies
+
+class SettingsDialog(QDialog):
+    """Settings configuration dialog."""
+    
+    def __init__(self, settings_manager, parent=None):
+        super().__init__(parent)
+        self.settings = settings_manager
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(400)
+        self.init_ui()
+        self.apply_style()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Recording Settings
+        rec_group = QGroupBox("Recording")
+        rec_layout = QVBoxLayout()
+        
+        self.save_silence_cb = QCheckBox("Save Silent Audio Files")
+        self.save_silence_cb.setChecked(self.settings.get("save_silence", False))
+        self.save_silence_cb.setToolTip("If unchecked, .wav files with no voice activity will be deleted.")
+        rec_layout.addWidget(self.save_silence_cb)
+        
+        rec_group.setLayout(rec_layout)
+        layout.addWidget(rec_group)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_settings)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+        
+    def save_settings(self):
+        self.settings.set("save_silence", self.save_silence_cb.isChecked())
+        self.settings.save()
+        self.accept()
+        
+    def apply_style(self):
+        self.setStyleSheet("""
+            QDialog { background-color: #0a0a0f; color: #fafafa; }
+            QGroupBox { border: 1px solid #2a2a3a; border-radius: 8px; margin-top: 8px; padding: 12px; background-color: #1a1a24; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: #a1a1aa; }
+            QCheckBox { color: #fafafa; spacing: 8px; }
+            QPushButton { background-color: #1a1a24; color: #fafafa; border: 1px solid #2a2a3a; border-radius: 6px; padding: 8px 16px; }
+            QPushButton:hover { background-color: #2a2a3a; }
+        """)
+
+class FrequencyDialog(QDialog):
+    """Dialog to save frequency."""
+    
+    def __init__(self, current_freq, freq_manager, parent=None):
+        super().__init__(parent)
+        self.freq_manager = freq_manager
+        self.setWindowTitle("Save Frequency")
+        self.setMinimumWidth(300)
+        
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel(f"Frequency: {current_freq:.3f} MHz"))
+        self.current_freq = current_freq
+        
+        layout.addWidget(QLabel("Label:"))
+        self.label_input = QLineEdit()
+        layout.addWidget(self.label_input)
+        
+        layout.addWidget(QLabel("Description:"))
+        self.desc_input = QLineEdit()
+        layout.addWidget(self.desc_input)
+        
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_freq)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+        
+        self.setStyleSheet("""
+            QDialog { background-color: #0a0a0f; color: #fafafa; }
+            QLabel { color: #fafafa; }
+            QLineEdit { background-color: #1a1a24; color: #fafafa; border: 1px solid #2a2a3a; border-radius: 6px; padding: 6px; }
+            QPushButton { background-color: #1a1a24; color: #fafafa; border: 1px solid #2a2a3a; border-radius: 6px; padding: 8px 16px; }
+            QPushButton:hover { background-color: #2a2a3a; }
+        """)
+        
+    def save_freq(self):
+        label = self.label_input.text().strip()
+        if not label:
+            QMessageBox.warning(self, "Error", "Label is required")
+            return
+        
+        self.freq_manager.add(self.current_freq, label, self.desc_input.text().strip())
+        self.accept()
+
 class WaterfallWidget(QWidget):
     """Waterfall spectrum display widget."""
     
@@ -51,13 +256,13 @@ class WaterfallWidget(QWidget):
         self.freq_max = 392.0
         self.full_freq_min = 390.0
         self.full_freq_max = 392.0
-        self.power_min = -120  # Fixed range
+        self.power_min = -85  # Bottom threshold per user specification
         self.power_max = 0     # Fixed range
         self.current_fft = None
         self.current_freqs = None
         self.peak_freq = None
         self.peak_power = None
-        self.noise_floor = -80  # Default noise floor threshold
+        self.noise_floor = -75  # Noise floor threshold per user specification (lowered)
         self.tuned_freq = None  # Currently tuned frequency
         self.bandwidth = 25000  # Default bandwidth in Hz
         self.mouse_freq = None  # Frequency under mouse cursor
@@ -414,14 +619,31 @@ class WaterfallWidget(QWidget):
             
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         
-        # Draw tuned frequency marker (Red vertical line)
-        if self.tuned_freq is not None and self.freq_min <= self.tuned_freq <= self.freq_max and freq_range > 0:
-            tuned_x = x + int(((self.tuned_freq - self.freq_min) / freq_range) * width)
-            # Semi-transparent red bar
-            painter.fillRect(tuned_x - 1, y, 3, height, QColor(255, 0, 0, 100))
-            # Solid red line
-            painter.setPen(QPen(QColor(255, 0, 0), 1))
-            painter.drawLine(tuned_x, y, tuned_x, y + height)
+        # Draw tuned frequency marker and bandwidth lines (Red)
+        if self.tuned_freq is not None and freq_range > 0:
+            center_freq = self.tuned_freq
+            bw_half = (self.bandwidth / 1e6) / 2  # Convert Hz to MHz
+
+            # Calculate x coordinates
+            x_center = x + int(((center_freq - self.freq_min) / freq_range) * width)
+            x_left = x + int(((center_freq - bw_half - self.freq_min) / freq_range) * width)
+            x_right = x + int(((center_freq + bw_half - self.freq_min) / freq_range) * width)
+
+            # Draw lines if within view
+            pen = QPen(QColor(255, 0, 0), 2)
+            painter.setPen(pen)
+
+            if 0 <= x_left <= width:
+                painter.drawLine(x_left, y, x_left, y + height)
+            if 0 <= x_right <= width:
+                painter.drawLine(x_right, y, x_right, y + height)
+
+            # Center line (dashed)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setWidth(1)
+            painter.setPen(pen)
+            if 0 <= x_center <= width:
+                painter.drawLine(x_center, y, x_center, y + height)
             
         # Draw bandwidth overlay if mouse is active
         if self.mouse_freq is not None and freq_range > 0:
@@ -861,12 +1083,19 @@ class ScannerDialog(QDialog):
             from rtl_capture import RTLCapture
             
             # Create RTL capture instance
-            rtl = RTLCapture(frequency=start, sample_rate=1.8e6, gain='auto')
+            rtl = RTLCapture(frequency=start, sample_rate=2.4e6, gain=50)
             if not rtl.open():
                 QMessageBox.warning(self, "Error", "Failed to open RTL-SDR device")
                 return
             
-            self.scanner = FrequencyScanner(rtl, scan_step=step)
+            # Initialize scanner with noise floor and bottom threshold parameters
+            self.scanner = FrequencyScanner(
+                rtl, 
+                sample_rate=2.4e6,
+                scan_step=step,
+                noise_floor=-45,  # Default noise floor
+                bottom_threshold=-85  # Default bottom threshold
+            )
             self.scan_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             self.results_table.setRowCount(0)
@@ -1011,9 +1240,9 @@ class CaptureThread(QThread):
         self.processor = None
         self.decoder = None
         self.voice_processor = None
-        self.frequency = 400e6
-        self.sample_rate = 1.8e6
-        self.gain = 'auto'
+        self.frequency = 390.865e6  # Default frequency per user request
+        self.sample_rate = 2.4e6  # Default sample rate per TETRA spec
+        self.gain = 50  # Default gain per user specification
         self.auto_decrypt = True
         self.monitor_raw = False  # New flag
         
@@ -1062,6 +1291,7 @@ class CaptureThread(QThread):
         
         try:
             self.status_update.emit("Initializing RTL-SDR...")
+            # RTLCapture accepts 'auto' as string or numeric gain value
             self.capture = RTLCapture(
                 frequency=self.frequency,
                 sample_rate=self.sample_rate,
@@ -1073,14 +1303,17 @@ class CaptureThread(QThread):
                 return
             
             self.processor = SignalProcessor(sample_rate=self.sample_rate)
-            self.decoder = TetraDecoder(auto_decrypt=True)
+            self.decoder = TetraDecoder(auto_decrypt=self.auto_decrypt)
             self.voice_processor = VoiceProcessor()
             
             self.status_update.emit(f"✓ Started - {self.frequency/1e6:.3f} MHz")
             
             while self.running:
                 try:
-                    samples = self.capture.read_samples(32*1024)  # Smaller chunk for faster updates (~60fps)
+                    # Read larger chunk to ensure full TETRA frames (which are ~14ms long)
+                    # 32k was too small (~13ms), causing frame splitting and decode failure
+                    # 128k is ~54ms (at 2.4MSps), containing ~3-4 full frames
+                    samples = self.capture.read_samples(128*1024)
                     
                     # Compute spectrum with proper windowing
                     # Use a fixed FFT size for consistent display resolution
@@ -1122,17 +1355,32 @@ class CaptureThread(QThread):
                         if end_idx > start_idx:
                             signal_power = np.mean(power[start_idx:end_idx])
                             peak_power = np.max(power[start_idx:end_idx])
-                            # Use average power for more stable detection
-                            if signal_power > -60:  # Threshold for signal presence (increased from -80 to avoid noise)
+                            
+                            # Calculate frequency offset for AFC
+                            # Find peak bin index
+                            peak_idx_local = np.argmax(power[start_idx:end_idx])
+                            peak_idx = start_idx + peak_idx_local
+                            
+                            # Calculate offset from center frequency (0 Hz in baseband)
+                            # freqs array is centered at 0
+                            peak_freq_offset = freqs[peak_idx]
+                            
+                            # Use peak power or average, whichever is higher for detection
+                            # Lower threshold to -75 dB to catch weaker signals (noise floor -45, bottom -85)
+                            detection_power = max(signal_power, peak_power - 5)  # Peak with 5 dB margin
+                            if detection_power > -75:  # More lenient threshold for signal presence
                                 self.signal_detected.emit(self.frequency, signal_power)
                                 signal_present = True
                     
-                    # Process and decode TETRA frames only if signal is present
-                    # This prevents false positives when there's no signal
-                    if signal_present:
-                        try:
-                            # Demodulate signal
-                            demodulated = self.processor.process(samples)
+                    # Always attempt to process and decode TETRA frames
+                    # This allows detection even if signal_present check fails (visible signals in spectrum)
+                    # signal_present is still used for power reporting and frame counting validation
+                    try:
+                            # Demodulate signal with AFC
+                            # Use calculated offset if signal is strong enough, otherwise 0
+                            # Lower AFC threshold to -70 dB to help with weaker signals
+                            afc_offset = peak_freq_offset if signal_present and peak_power > -70 else 0
+                            demodulated = self.processor.process(samples, freq_offset=afc_offset)
                             
                             # Store demodulated symbols for voice extraction
                             # Get symbols from processor if available
@@ -1173,12 +1421,29 @@ class CaptureThread(QThread):
                                 except Exception as audio_err:
                                     pass
                         
-                            # Decode TETRA frames only if signal is present
-                            if signal_present:
-                                frames = self.decoder.decode(demodulated)
+                            # Decode TETRA frames (always attempt, even if signal_present check failed)
+                            # This allows detection of weak signals that are visible in spectrum
+                            try:
+                                # Ensure we have enough symbols to decode (need at least one frame = 255 symbols)
+                                if demodulated is None or len(demodulated) < 255:
+                                    frames = []
+                                else:
+                                    frames = self.decoder.decode(demodulated)
+                                    # Log when frames are found (but limit logging frequency)
+                                    if len(frames) > 0:
+                                        import time
+                                        if not hasattr(self, '_last_frame_log_time'):
+                                            self._last_frame_log_time = 0
+                                        current_time = time.time()
+                                        if current_time - getattr(self, '_last_frame_log_time', 0) > 5.0:
+                                            logger.info(f"✓ Decoded {len(frames)} TETRA frame(s) from signal")
+                                            self._last_frame_log_time = current_time
+                            except Exception as decode_err:
+                                logger.debug(f"Decode error: {decode_err}")
+                                frames = []
                             
-                                # Emit all decoded frames
-                                for frame in frames:
+                            # Emit all decoded frames
+                            for frame in frames:
                                     # Try to extract and decode voice from frames
                                     try:
                                         if self.voice_processor and self.voice_processor.working:
@@ -1213,9 +1478,19 @@ class CaptureThread(QThread):
                                                                 bit_list.append((byte_val >> (7 - bit_idx)) & 1)
                                                         voice_bits = np.array(bit_list, dtype=np.uint8)
                                                 
+                                                # Check if frame is encrypted and decrypted - OVERRIDE bits
+                                                if frame.get('decrypted') and 'decrypted_payload' in frame:
+                                                    try:
+                                                        payload_str = frame['decrypted_payload']
+                                                        # Convert string '0101...' to list of ints
+                                                        voice_bits = np.array([int(b) for b in payload_str], dtype=np.uint8)
+                                                    except Exception as e:
+                                                        logger.debug(f"Error using decrypted payload: {e}")
+
                                                 # Try to extract voice slot from symbol stream (preferred method)
                                                 codec_input = None
-                                                if hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
+                                                # Only use symbols if NOT encrypted (symbols are raw/encrypted)
+                                                if not frame.get('encrypted') and hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
                                                     codec_input = self._extract_voice_slot_from_symbols(frame, self.demodulated_symbols, self.samples_per_symbol)
                                                 
                                                 # If extraction from symbols failed, try alternative method
@@ -1246,25 +1521,25 @@ class CaptureThread(QThread):
                                                     # Block 1: positions 1-114
                                                     for i in range(1, 115):
                                                         if idx < len(soft_bits):
-                                                            block[i] = soft_bits[idx] & 0x00FF  # Mask to 8-bit range
+                                                            block[i] = soft_bits[idx]
                                                             idx += 1
                                                     
                                                     # Block 2: positions 116-229 (161-45=116)
                                                     for i in range(116, 230):
                                                         if idx < len(soft_bits):
-                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            block[i] = soft_bits[idx]
                                                             idx += 1
                                                     
                                                     # Block 3: positions 231-344 (321-45-45=231)
                                                     for i in range(231, 345):
                                                         if idx < len(soft_bits):
-                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            block[i] = soft_bits[idx]
                                                             idx += 1
                                                     
                                                     # Block 4: positions 346-435 (481-45-45-45=346, 90 values)
                                                     for i in range(346, 436):
                                                         if idx < len(soft_bits):
-                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            block[i] = soft_bits[idx]
                                                             idx += 1
                                                     
                                                     # Pack as binary (little-endian signed shorts)
@@ -1305,14 +1580,11 @@ class CaptureThread(QThread):
                                         logger.debug(f"Voice decode error: {voice_err}")
                             
                                     self.frame_decoded.emit(frame)
-                            else:
-                                # No signal - don't decode to avoid false positives
-                                frames = []
-                        
+                            
                             # Don't generate test frames - only show real decoded frames
                             # Test frames cause false positives and confusion
                     
-                        except Exception as decode_err:
+                    except Exception as decode_err:
                             # Log error but don't spam
                             if not hasattr(self, '_decode_error_logged'):
                                 self.error_occurred.emit(f"Decode error: {decode_err}")
@@ -1463,25 +1735,25 @@ class CaptureThread(QThread):
             # Block 1: positions 1-114
             for i in range(1, 115):
                 if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx] & 0x00FF  # Mask to 8-bit range
+                    block[i] = scaled_soft_bits[idx]  # No mask for signed short
                     idx += 1
             
             # Block 2: positions 116-229 (161-45=116)
             for i in range(116, 230):
                 if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    block[i] = scaled_soft_bits[idx]
                     idx += 1
             
             # Block 3: positions 231-344 (321-45-45=231)
             for i in range(231, 345):
                 if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    block[i] = scaled_soft_bits[idx]
                     idx += 1
             
             # Block 4: positions 346-435 (481-45-45-45=346, 90 values)
             for i in range(346, 436):
                 if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    block[i] = scaled_soft_bits[idx]
                     idx += 1
             
             # Pack as little-endian signed shorts
@@ -1613,10 +1885,19 @@ class ModernTetraGUI(QMainWindow):
         self.continuous_recording = True
         self.audio_buffer = []
         self.recording_active = False
+        self.recording_enabled = False  # Manual recording toggle
         self.recording_start_time = None
+        self.recording_has_audio = False  # Track if valid audio was recorded
+        
+        # Managers
+        self.settings_manager = SettingsManager()
+        self.freq_manager = FrequencyManager()
         
         self.init_ui()
         self.apply_modern_style()
+        
+        # Load settings
+        self.load_settings()
         
         # Update timer
         self.update_timer = QTimer()
@@ -1626,6 +1907,41 @@ class ModernTetraGUI(QMainWindow):
         # Initialize audio
         self.init_audio()
     
+    def load_settings(self):
+        """Load initial settings."""
+        s = self.settings_manager
+        self.freq_input.setText(str(s.get("last_frequency", 390.865)))
+        self.auto_decrypt_cb.setChecked(s.get("auto_decrypt", True))
+        self.hear_voice_cb.setChecked(s.get("monitor_audio", True))
+        self.monitor_raw_cb.setChecked(s.get("monitor_raw", False))
+        
+        # Update presets
+        self.update_presets()
+
+    def update_presets(self):
+        """Update preset combo box."""
+        self.freq_preset.clear()
+        self.freq_preset.addItem("Custom")
+        for item in self.freq_manager.get_all():
+            self.freq_preset.addItem(f"{item['freq']:.3f} MHz - {item['label']}")
+
+    def open_settings(self):
+        """Open settings dialog."""
+        dlg = SettingsDialog(self.settings_manager, self)
+        if dlg.exec():
+            # Apply settings immediately if needed
+            pass
+
+    def save_current_freq(self):
+        """Open save frequency dialog."""
+        try:
+            freq = float(self.freq_input.text())
+            dlg = FrequencyDialog(freq, self.freq_manager, self)
+            if dlg.exec():
+                self.update_presets()
+        except ValueError:
+            pass
+
     def init_ui(self):
         """Initialize UI with compact layout."""
         central = QWidget()
@@ -1637,8 +1953,8 @@ class ModernTetraGUI(QMainWindow):
         # Top controls - with proper size policy
         control_panel = self.create_control_panel()
         control_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        control_panel.setMinimumHeight(180)
-        control_panel.setMaximumHeight(300)
+        control_panel.setMinimumHeight(320)  # Increased height to fix squished UI
+        control_panel.setMaximumHeight(450)
         main_splitter.addWidget(control_panel)
         
         # Waterfall spectrum - with proportional sizing
@@ -1707,12 +2023,12 @@ class ModernTetraGUI(QMainWindow):
         # Main container with horizontal layout - compact
         main_widget = QWidget()
         main_layout = QHBoxLayout(main_widget)
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(12)  # Increased spacing
+        main_layout.setContentsMargins(10, 10, 10, 10)
         
         # Left column: Frequency and tuning - compact
         left_col = QVBoxLayout()
-        left_col.setSpacing(6)
+        left_col.setSpacing(8)  # Increased spacing
         
         # Frequency group
         freq_group = QGroupBox("Frequency")
@@ -1722,11 +2038,19 @@ class ModernTetraGUI(QMainWindow):
         freq_label = QLabel("Frequency (MHz):")
         freq_label.setMinimumWidth(100)
         freq_row1.addWidget(freq_label)
-        self.freq_input = QLineEdit("390.000")
+        self.freq_input = QLineEdit("390.865")  # Default frequency per user specification
         self.freq_input.setMinimumWidth(100)
         self.freq_input.setMaximumWidth(150)
         self.freq_input.setPlaceholderText("390.000")
         freq_row1.addWidget(self.freq_input, 1)  # Stretch factor
+        
+        # Save Freq Button
+        self.save_freq_btn = QPushButton("💾")
+        self.save_freq_btn.setToolTip("Save Frequency")
+        self.save_freq_btn.setMaximumWidth(40)
+        self.save_freq_btn.clicked.connect(self.save_current_freq)
+        freq_row1.addWidget(self.save_freq_btn)
+        
         self.tune_btn = QPushButton("⚡ Tune")
         self.tune_btn.clicked.connect(self.on_tune)
         self.tune_btn.setMinimumWidth(80)
@@ -1738,13 +2062,7 @@ class ModernTetraGUI(QMainWindow):
         preset_label.setMinimumWidth(100)
         freq_row2.addWidget(preset_label)
         self.freq_preset = QComboBox()
-        self.freq_preset.addItems([
-            "Custom",
-            "390.000 MHz (PL)",
-            "392.500 MHz (PL)",
-            "395.000 MHz (PL)",
-            "420.000 MHz (EU)",
-        ])
+        # Items populated by update_presets()
         self.freq_preset.currentTextChanged.connect(self.on_preset_changed)
         freq_row2.addWidget(self.freq_preset, 1)  # Stretch factor
         freq_layout.addLayout(freq_row2)
@@ -1782,6 +2100,15 @@ class ModernTetraGUI(QMainWindow):
         self.stop_btn.setMinimumHeight(40)
         self.stop_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         button_row1.addWidget(self.stop_btn, 1)  # Stretch factor
+        
+        self.record_btn = QPushButton("🔴 REC")
+        self.record_btn.setCheckable(True)
+        self.record_btn.clicked.connect(self.toggle_recording)
+        self.record_btn.setMinimumHeight(40)
+        self.record_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.record_btn.setStyleSheet("QPushButton:checked { background-color: #7f1d1d; border-color: #ef4444; }")
+        button_row1.addWidget(self.record_btn, 1)
+        
         button_layout.addLayout(button_row1)
         
         button_row2 = QHBoxLayout()
@@ -1797,6 +2124,14 @@ class ModernTetraGUI(QMainWindow):
         self.load_keys_btn.setMinimumHeight(36)
         self.load_keys_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         button_row2.addWidget(self.load_keys_btn, 1)  # Stretch factor
+        
+        # Settings Button
+        self.settings_btn = QPushButton("⚙️ Settings")
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.settings_btn.setMinimumHeight(36)
+        self.settings_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        button_row2.addWidget(self.settings_btn, 1)
+        
         button_layout.addLayout(button_row2)
         button_group.setLayout(button_layout)
         left_col.addWidget(button_group)
@@ -1819,11 +2154,11 @@ class ModernTetraGUI(QMainWindow):
         self.gain_slider = QSlider(Qt.Orientation.Horizontal)
         self.gain_slider.setMinimum(0)
         self.gain_slider.setMaximum(100)  # 0-50 with 0.5 steps
-        self.gain_slider.setValue(50)  # Default 25.0
+        self.gain_slider.setValue(100)  # Default 50.0 (100/2 = 50)
         self.gain_slider.valueChanged.connect(self.on_gain_slider_changed)
         self.gain_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         gain_row.addWidget(self.gain_slider, 1)  # Stretch factor
-        self.gain_label = QLabel("25.0 dB")
+        self.gain_label = QLabel("50.0 dB")
         self.gain_label.setMinimumWidth(70)
         self.gain_label.setMaximumWidth(80)
         self.gain_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1833,7 +2168,7 @@ class ModernTetraGUI(QMainWindow):
         gain_group.setLayout(gain_layout)
         middle_col.addWidget(gain_group)
         
-        # Sample Rate slider - with 0.1 MHz steps from 1.8 to 2.4 MHz
+        # Sample Rate slider - with 0.1 MHz steps from 1.8 to 10.0 MHz
         sample_rate_group = QGroupBox("Sample Rate")
         sample_rate_layout = QVBoxLayout()
         sample_rate_row = QHBoxLayout()
@@ -1842,15 +2177,16 @@ class ModernTetraGUI(QMainWindow):
         rate_label.setMinimumWidth(50)
         sample_rate_row.addWidget(rate_label)
         self.sample_rate_slider = QSlider(Qt.Orientation.Horizontal)
-        # 1.8 to 2.4 MHz in 0.1 MHz steps = 6 steps (0-6)
+        # 1.8 to 10.0 MHz in 0.1 MHz steps
+        # (10.0 - 1.8) / 0.1 = 82 steps
         self.sample_rate_slider.setMinimum(0)  # 1.8 MHz
-        self.sample_rate_slider.setMaximum(6)   # 2.4 MHz (1.8 + 6*0.1)
-        self.sample_rate_slider.setValue(0)     # Default 1.8 MHz
+        self.sample_rate_slider.setMaximum(82)   # 10.0 MHz
+        self.sample_rate_slider.setValue(6)     # Default 2.4 MHz (1.8 + 6*0.1)
         self.sample_rate_slider.setSingleStep(1)  # Step by 1 (0.1 MHz)
         self.sample_rate_slider.valueChanged.connect(self.on_sample_rate_slider_changed)
         self.sample_rate_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         sample_rate_row.addWidget(self.sample_rate_slider, 1)  # Stretch factor
-        self.sample_rate_label = QLabel("1.8 MHz")
+        self.sample_rate_label = QLabel("2.4 MHz")
         self.sample_rate_label.setMinimumWidth(70)
         self.sample_rate_label.setMaximumWidth(80)
         self.sample_rate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1864,12 +2200,11 @@ class ModernTetraGUI(QMainWindow):
         options_group = QGroupBox("Options")
         options_layout = QVBoxLayout()
         self.auto_decrypt_cb = QCheckBox("Auto-Decrypt")
-        self.auto_decrypt_cb.setChecked(True)
+        self.auto_decrypt_cb.setChecked(False)
         options_layout.addWidget(self.auto_decrypt_cb)
         
         self.hear_voice_cb = QCheckBox("🔊 Monitor Audio")
-        self.hear_voice_cb.setChecked(True)  # Enable by default
-        self.hear_voice_cb.setChecked(False)  # Default to OFF to avoid noise
+        self.hear_voice_cb.setChecked(False)  # Disable by default
         self.hear_voice_cb.setToolTip("Listen to decoded voice (if available)")
         options_layout.addWidget(self.hear_voice_cb)
         
@@ -1887,12 +2222,13 @@ class ModernTetraGUI(QMainWindow):
         
         # Right column: Spectrum Display Controls
         right_col = QVBoxLayout()
-        right_col.setSpacing(6)
+        right_col.setSpacing(8)
         
         # Display Controls Group (Combined with Noise Floor)
         display_group = QGroupBox("Spectrum Display")
         display_layout = QVBoxLayout()
-        display_layout.setSpacing(8)
+        display_layout.setSpacing(10)  # Increased spacing between sliders
+        display_layout.setContentsMargins(10, 15, 10, 10)  # Add top margin for title
         
         # Zoom Slider
         zoom_row = QHBoxLayout()
@@ -1933,15 +2269,33 @@ class ModernTetraGUI(QMainWindow):
         self.noise_floor_slider = QSlider(Qt.Orientation.Horizontal)
         self.noise_floor_slider.setMinimum(-140)
         self.noise_floor_slider.setMaximum(-40)
-        self.noise_floor_slider.setValue(-120)  # Default
+        self.noise_floor_slider.setValue(-85)  # Default bottom threshold per user specification
         self.noise_floor_slider.valueChanged.connect(self.on_noise_floor_changed)
         noise_floor_row.addWidget(self.noise_floor_slider)
         
-        self.noise_floor_label = QLabel("-120 dB")
+        self.noise_floor_label = QLabel("-85 dB")
         self.noise_floor_label.setMinimumWidth(50)
         noise_floor_row.addWidget(self.noise_floor_label)
         
         display_layout.addLayout(noise_floor_row)
+        
+        # Threshold Slider (Yellow Line)
+        threshold_row = QHBoxLayout()
+        threshold_label = QLabel("Threshold:")
+        threshold_label.setMinimumWidth(60)
+        threshold_row.addWidget(threshold_label)
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.threshold_slider.setMinimum(-100)
+        self.threshold_slider.setMaximum(-20)
+        self.threshold_slider.setValue(-75)  # Default threshold
+        self.threshold_slider.valueChanged.connect(self.on_threshold_changed)
+        threshold_row.addWidget(self.threshold_slider)
+        
+        self.threshold_label = QLabel("-75 dB")
+        self.threshold_label.setMinimumWidth(50)
+        threshold_row.addWidget(self.threshold_label)
+        
+        display_layout.addLayout(threshold_row)
         
         # Denoiser Checkbox
         self.denoiser_cb = QCheckBox("Denoiser (Smooth)")
@@ -1954,6 +2308,9 @@ class ModernTetraGUI(QMainWindow):
         # Status indicators (Moved from right column bottom)
         status_group = QGroupBox("Status")
         status_layout = QVBoxLayout() # Changed to vertical for TETRA status
+        status_layout.setSpacing(8)
+        status_layout.setContentsMargins(10, 15, 10, 10)
+        
         status_row1 = QHBoxLayout()
         self.signal_label = QLabel("⚫ No Signal")
         self.signal_label.setStyleSheet("font-weight: bold; padding: 5px;")
@@ -1963,6 +2320,11 @@ class ModernTetraGUI(QMainWindow):
         self.decrypt_label.setStyleSheet("font-weight: bold; padding: 5px;")
         status_row1.addWidget(self.decrypt_label)
         status_layout.addLayout(status_row1)
+        
+        # Recording status
+        self.recording_status_label = QLabel("⚫ Not Recording")
+        self.recording_status_label.setStyleSheet("font-weight: bold; padding: 5px; color: #888888;")
+        status_layout.addWidget(self.recording_status_label)
         
         # TETRA signal detection status
         self.tetra_status_label = QLabel("⚫ No TETRA Signal")
@@ -1994,6 +2356,10 @@ class ModernTetraGUI(QMainWindow):
         self.type_filter.currentTextChanged.connect(self.apply_filter)
         control_layout.addWidget(self.type_filter)
         
+        self.decrypted_only_cb = QCheckBox("Decrypted/Text Only")
+        self.decrypted_only_cb.toggled.connect(lambda: self.apply_filter(self.type_filter.currentText()))
+        control_layout.addWidget(self.decrypted_only_cb)
+        
         control_layout.addSpacing(20)
         
         self.autoscroll_cb = QCheckBox("Auto-scroll")
@@ -2007,12 +2373,7 @@ class ModernTetraGUI(QMainWindow):
         control_layout.addStretch()
         layout.addLayout(control_layout)
         
-        # Table with scroll area
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        
+        # Table (no scroll area wrapper needed for QTableWidget)
         self.frames_table = QTableWidget()
         self.frames_table.setColumnCount(7)  # Added Data column
         self.frames_table.setHorizontalHeaderLabels([
@@ -2045,6 +2406,7 @@ class ModernTetraGUI(QMainWindow):
         self.frames_table.verticalHeader().setVisible(False)
         self.frames_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.frames_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.frames_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Add tooltips to headers
         headers = ["Time", "Frame #", "Type", "Description", "Encrypted", "Status", "Data"]
@@ -2062,8 +2424,7 @@ class ModernTetraGUI(QMainWindow):
             if item:
                 item.setToolTip(tooltip)
         
-        scroll_area.setWidget(self.frames_table)
-        layout.addWidget(scroll_area)
+        layout.addWidget(self.frames_table)
         
         widget.setLayout(layout)
         return widget
@@ -2072,6 +2433,23 @@ class ModernTetraGUI(QMainWindow):
         """Create calls tab."""
         widget = QWidget()
         layout = QVBoxLayout()
+        
+        # Filter controls
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter Group:"))
+        self.calls_group_filter = QLineEdit()
+        self.calls_group_filter.setPlaceholderText("GSSI...")
+        self.calls_group_filter.textChanged.connect(self.apply_calls_filter)
+        filter_layout.addWidget(self.calls_group_filter)
+        
+        filter_layout.addWidget(QLabel("Filter Client:"))
+        self.calls_client_filter = QLineEdit()
+        self.calls_client_filter.setPlaceholderText("ISSI...")
+        self.calls_client_filter.textChanged.connect(self.apply_calls_filter)
+        filter_layout.addWidget(self.calls_client_filter)
+        
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
         
         # Table
         self.calls_table = QTableWidget()
@@ -2113,6 +2491,17 @@ class ModernTetraGUI(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
         
+        # Filter controls
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter Group:"))
+        self.users_group_filter = QLineEdit()
+        self.users_group_filter.setPlaceholderText("GSSI...")
+        self.users_group_filter.textChanged.connect(self.apply_users_filter)
+        filter_layout.addWidget(self.users_group_filter)
+        
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+        
         # Table
         self.users_table = QTableWidget()
         self.users_table.setColumnCount(7)
@@ -2141,7 +2530,12 @@ class ModernTetraGUI(QMainWindow):
         refresh_btn = QPushButton("🔄 Refresh")
         refresh_btn.clicked.connect(self.update_stats)
         layout.addWidget(refresh_btn)
-        
+
+        # Auto-refresh timer
+        self.stats_timer = QTimer()
+        self.stats_timer.timeout.connect(self.update_stats)
+        self.stats_timer.start(1000)  # 1 second
+
         widget.setLayout(layout)
         return widget
     
@@ -2411,14 +2805,13 @@ class ModernTetraGUI(QMainWindow):
 
     def on_preset_changed(self, text):
         """Handle frequency preset."""
-        if "390.000" in text:
-            self.freq_input.setText("390.000")
-        elif "392.500" in text:
-            self.freq_input.setText("392.500")
-        elif "395.000" in text:
-            self.freq_input.setText("395.000")
-        elif "420.000" in text:
-            self.freq_input.setText("420.000")
+        # Extract frequency from text "390.000 MHz - Label"
+        try:
+            if "MHz" in text:
+                freq_str = text.split("MHz")[0].strip()
+                self.freq_input.setText(freq_str)
+        except:
+            pass
     
     def on_bandwidth_changed(self, text):
         """Handle bandwidth change."""
@@ -2429,11 +2822,33 @@ class ModernTetraGUI(QMainWindow):
         except ValueError:
             pass
 
+    def toggle_recording(self):
+        """Toggle recording state."""
+        self.recording_enabled = self.record_btn.isChecked()
+        if not self.recording_enabled and self.recording_active:
+            self.save_recording()
+            
+    def reset_stats(self):
+        """Reset all statistics and tables."""
+        self.frame_count = 0
+        self.decrypted_count = 0
+        self.tetra_sync_count = 0
+        self.tetra_frame_count = 0
+        self.tetra_valid_frames = 0
+        self.frames_table.setRowCount(0)
+        self.calls_table.setRowCount(0)
+        self.groups_table.setRowCount(0)
+        self.users_table.setRowCount(0)
+        self.update_displays()
+
     def on_tune(self):
         """Tune to frequency."""
         try:
             freq_mhz = float(self.freq_input.text())
             freq_hz = freq_mhz * 1e6
+            
+            # Reset stats and tables on retune
+            self.reset_stats()
             
             # Update tuned frequency display
             if hasattr(self, 'waterfall'):
@@ -2480,10 +2895,16 @@ class ModernTetraGUI(QMainWindow):
             self.waterfall.grid_cache = None
             self.waterfall.grid_cache_params = None
             self.waterfall.update()
+            
+    def on_threshold_changed(self, value):
+        """Handle threshold slider change."""
+        self.threshold_label.setText(f"{value} dB")
+        if hasattr(self, 'waterfall'):
+            self.waterfall.set_noise_floor(value)
     
     def on_sample_rate_slider_changed(self, value):
         """Handle sample rate slider change."""
-        # Convert slider value (0-6) to MHz (1.8 to 2.4 in 0.1 steps)
+        # Convert slider value (0-82) to MHz (1.8 to 10.0 in 0.1 steps)
         sample_rate_mhz = 1.8 + (value * 0.1)
         self.sample_rate_label.setText(f"{sample_rate_mhz:.1f} MHz")
         self.sample_rate = sample_rate_mhz * 1e6
@@ -2527,16 +2948,15 @@ class ModernTetraGUI(QMainWindow):
             if hasattr(self, 'gain_slider'):
                 gain = self.gain_slider.value() / 2.0
             else:
-                gain = 25.0  # Default
+                gain = 50.0  # Default per user specification
             
             # Get sample rate from slider
             if hasattr(self, 'sample_rate_slider'):
-                if self.sample_rate_slider.value() == 0:
-                    sample_rate = 1.8e6
-                else:
-                    sample_rate = 2.4e6
+                # Value 0 = 1.8 MHz, value 82 = 10.0 MHz
+                slider_value = self.sample_rate_slider.value()
+                sample_rate = (1.8 + slider_value * 0.1) * 1e6
             else:
-                sample_rate = 1.8e6
+                sample_rate = 2.4e6  # Default per TETRA spec
             
             self.capture_thread = CaptureThread()
             self.capture_thread.frequency = freq_hz
@@ -2611,6 +3031,13 @@ class ModernTetraGUI(QMainWindow):
     def on_signal(self, freq, power):
         """Handle signal detection."""
         self.signal_label.setText(f"🟢 {power:.1f} dB")
+        
+        # If we detect a signal but haven't decoded frames yet, show status
+        if self.tetra_frame_count == 0:
+            self.tetra_status_label.setText("🟡 Signal Detected (Decoding...)")
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #ffaa00; background-color: #221100;"
+            )
     
     def init_audio(self):
         """Initialize audio stream."""
@@ -2640,6 +3067,14 @@ class ModernTetraGUI(QMainWindow):
         from datetime import datetime
         import wave
         
+        # Validate amplitude (must be > 0)
+        if len(data) == 0:
+            return
+            
+        max_amp = np.max(np.abs(data))
+        if max_amp <= 0:
+            return  # Skip silent/invalid frames
+        
         # Continuous recording to single WAV file
         if len(data) > 0:
             try:
@@ -2647,7 +3082,7 @@ class ModernTetraGUI(QMainWindow):
                 audio_int16 = (data * 32767).astype(np.int16)
                 
                 # Start new recording if not active
-                if not self.recording_active:
+                if self.recording_enabled and not self.recording_active:
                     records_dir = os.path.join(os.path.dirname(__file__), "records")
                     os.makedirs(records_dir, exist_ok=True)
                     
@@ -2663,11 +3098,13 @@ class ModernTetraGUI(QMainWindow):
                     
                     self.recording_active = True
                     self.recording_start_time = datetime.now()
+                    self.recording_has_audio = False
                     self.log(f"🎙️ Recording: {os.path.basename(self.current_wav_file)}")
                 
                 # Write to continuous WAV file
                 if self.recording_active and hasattr(self, 'wav_file'):
                     self.wav_file.writeframes(audio_int16.tobytes())
+                    self.recording_has_audio = True
                 
             except Exception as e:
                 logger.debug(f"Failed to record voice: {e}")
@@ -2689,7 +3126,8 @@ class ModernTetraGUI(QMainWindow):
                         self.audio_stream.start()
                     
                     # Write audio data - YOU WILL HEAR THIS LIVE!
-                    self.audio_stream.write(data.astype(np.float32))
+                    # Normalize int16 to float32 range [-1.0, 1.0]
+                    self.audio_stream.write(data.astype(np.float32) / 32768.0)
             except Exception as e:
                 logger.debug(f"Audio playback error: {e}")
                 # Try to reinitialize audio stream
@@ -2701,7 +3139,7 @@ class ModernTetraGUI(QMainWindow):
                             pass
                     self.init_audio()
                     if hasattr(self, 'audio_stream') and self.audio_stream:
-                        self.audio_stream.write(data.astype(np.float32))
+                        self.audio_stream.write(data.astype(np.float32) / 32768.0)
                 except Exception as e2:
                     logger.debug(f"Audio reinit failed: {e2}")
 
@@ -2711,7 +3149,19 @@ class ModernTetraGUI(QMainWindow):
             try:
                 self.wav_file.close()
                 duration = (datetime.now() - self.recording_start_time).total_seconds()
-                self.log(f"Saved voice recording: {os.path.basename(self.current_wav_file)} ({duration:.1f}s)")
+                
+                # Check if we should keep the file
+                save_silence = self.settings_manager.get("save_silence", False)
+                if not save_silence and not self.recording_has_audio:
+                    # Delete silent file
+                    try:
+                        os.remove(self.current_wav_file)
+                        self.log(f"Deleted silent recording: {os.path.basename(self.current_wav_file)}")
+                    except Exception as e:
+                        logger.debug(f"Failed to delete silent file: {e}")
+                else:
+                    self.log(f"Saved voice recording: {os.path.basename(self.current_wav_file)} ({duration:.1f}s)")
+                
                 self.recording_active = False
             except Exception as e:
                 logger.debug(f"Failed to close recording: {e}")
@@ -2756,7 +3206,8 @@ class ModernTetraGUI(QMainWindow):
         # Try to decode as text if it looks printable
         try:
             printable_count = sum(1 for b in data if 32 <= b <= 126 or b in (10, 13))
-            if len(data) > 0 and (printable_count / len(data)) > 0.5:
+            # Increased threshold to 0.8 to avoid garbage random letters
+            if len(data) > 0 and (printable_count / len(data)) > 0.8:
                 text = data.decode('latin-1', errors='replace')
                 text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else '' for c in text)
                 text = text.strip()
@@ -2770,6 +3221,8 @@ class ModernTetraGUI(QMainWindow):
     def apply_filter(self, text):
         """Apply type filter to existing rows."""
         filter_type = text.lower()
+        decrypted_only = self.decrypted_only_cb.isChecked()
+        
         for row in range(self.frames_table.rowCount()):
             type_item = self.frames_table.item(row, 2)
             if not type_item:
@@ -2778,35 +3231,94 @@ class ModernTetraGUI(QMainWindow):
             type_text = type_item.text().lower()
             visible = True
             
-            if "traffic" in filter_type and "traffic" not in type_text:
-                visible = False
-            elif "control" in filter_type and "control" not in type_text:
-                visible = False
-            elif "broadcast" in filter_type and "broadcast" not in type_text:
-                visible = False
-            elif "mac" in filter_type and "mac" not in type_text and "traffic" not in type_text and "control" not in type_text and "broadcast" not in type_text:
-                visible = False
-            elif "sds" in filter_type:
-                has_sds = "sds" in type_text or "data" in type_text or "suppl" in type_text or "sns" in type_text
-                # Also check description for "SDS" or "Text"
-                desc_item = self.frames_table.item(row, 3)
-                if desc_item and ("sds" in desc_item.text().lower() or "text" in desc_item.text().lower()):
-                    has_sds = True
-                    
-                if not has_sds:
-                    visible = False
-            elif "audio" in filter_type:
-                # Check for voice/audio
+            # Check decrypted/text only filter
+            if decrypted_only:
+                status_item = self.frames_table.item(row, 5)
                 data_item = self.frames_table.item(row, 6)
-                if data_item and "voice" in data_item.text().lower():
-                    visible = True
-                else:
+                desc_item = self.frames_table.item(row, 3)
+                
+                is_decrypted = status_item and "decrypted" in status_item.text().lower()
+                has_text = data_item and "📝" in data_item.text()
+                is_reassembled = desc_item and "🧩" in desc_item.text()
+                
+                if not (is_decrypted or has_text or is_reassembled):
                     visible = False
+            
+            if visible:
+                if "traffic" in filter_type and "traffic" not in type_text:
+                    visible = False
+                elif "control" in filter_type and "control" not in type_text:
+                    visible = False
+                elif "broadcast" in filter_type and "broadcast" not in type_text:
+                    visible = False
+                elif "mac" in filter_type and "mac" not in type_text and "traffic" not in type_text and "control" not in type_text and "broadcast" not in type_text:
+                    visible = False
+                elif "sds" in filter_type:
+                    has_sds = "sds" in type_text or "data" in type_text or "suppl" in type_text or "sns" in type_text
+                    # Also check description for "SDS" or "Text"
+                    desc_item = self.frames_table.item(row, 3)
+                    if desc_item and ("sds" in desc_item.text().lower() or "text" in desc_item.text().lower()):
+                        has_sds = True
+                        
+                    if not has_sds:
+                        visible = False
+                elif "audio" in filter_type:
+                    # Check for voice/audio
+                    data_item = self.frames_table.item(row, 6)
+                    if data_item and "voice" in data_item.text().lower():
+                        visible = True
+                    else:
+                        visible = False
                 
             self.frames_table.setRowHidden(row, not visible)
 
+    def apply_calls_filter(self):
+        """Apply filters to calls table."""
+        group_filter = self.calls_group_filter.text().lower()
+        client_filter = self.calls_client_filter.text().lower()
+        
+        for row in range(self.calls_table.rowCount()):
+            visible = True
+            
+            # Check Group (To column often contains TG)
+            if group_filter:
+                to_item = self.calls_table.item(row, 8)
+                if not to_item or group_filter not in to_item.text().lower():
+                    visible = False
+            
+            # Check Client (From or To)
+            if visible and client_filter:
+                from_item = self.calls_table.item(row, 7)
+                to_item = self.calls_table.item(row, 8)
+                
+                from_match = from_item and client_filter in from_item.text().lower()
+                to_match = to_item and client_filter in to_item.text().lower()
+                
+                if not (from_match or to_match):
+                    visible = False
+            
+            self.calls_table.setRowHidden(row, not visible)
+
+    def apply_users_filter(self):
+        """Apply filters to users table."""
+        group_filter = self.users_group_filter.text().lower()
+        
+        for row in range(self.users_table.rowCount()):
+            visible = True
+            
+            if group_filter:
+                gssi_item = self.users_table.item(row, 2)
+                if not gssi_item or group_filter not in gssi_item.text().lower():
+                    visible = False
+            
+            self.users_table.setRowHidden(row, not visible)
+
     def update_tables(self, frame):
         """Update Calls, Groups, and Users tables."""
+        # Double check auto-decrypt setting - safeguard against unwanted population
+        if not self.auto_decrypt_cb.isChecked():
+            return
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         
         # Extract metadata
@@ -2831,7 +3343,13 @@ class ModernTetraGUI(QMainWindow):
             row = self.calls_table.rowCount()
             self.calls_table.insertRow(row)
             self.calls_table.setItem(row, 0, QTableWidgetItem(timestamp))
-            self.calls_table.setItem(row, 1, QTableWidgetItem(fmt(frame.get('frequency')))) # MCarrier
+            
+            # MCarrier (Main Carrier) - Use tuned frequency if not specified
+            mcarrier = fmt(frame.get('frequency'))
+            if not mcarrier and hasattr(self, 'freq_input'):
+                mcarrier = self.freq_input.text()
+            self.calls_table.setItem(row, 1, QTableWidgetItem(mcarrier)) # MCarrier
+            
             self.calls_table.setItem(row, 2, QTableWidgetItem(fmt(meta.get('channel')))) # Carrier
             self.calls_table.setItem(row, 3, QTableWidgetItem(fmt(frame.get('timeslot')))) # Slot
             self.calls_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('call_identifier')))) # CallID
@@ -2865,6 +3383,10 @@ class ModernTetraGUI(QMainWindow):
                     found = True
                     # Update Last Seen (LO)
                     self.groups_table.setItem(r, 1, QTableWidgetItem(timestamp))
+                    # Update REC status
+                    rec_status = "🔴" if self.recording_active else ""
+                    self.groups_table.setItem(r, 2, QTableWidgetItem(rec_status))
+                    
                     # Update other fields if they were empty
                     if not self.groups_table.item(r, 3).text():
                         self.groups_table.setItem(r, 3, QTableWidgetItem(fmt(meta.get('mcc'))))
@@ -2877,11 +3399,14 @@ class ModernTetraGUI(QMainWindow):
                 self.groups_table.insertRow(row)
                 self.groups_table.setItem(row, 0, QTableWidgetItem(gssi))
                 self.groups_table.setItem(row, 1, QTableWidgetItem(timestamp)) # LO
-                self.groups_table.setItem(row, 2, QTableWidgetItem("")) # REC
+                
+                rec_status = "🔴" if self.recording_active else ""
+                self.groups_table.setItem(row, 2, QTableWidgetItem(rec_status)) # REC
+                
                 self.groups_table.setItem(row, 3, QTableWidgetItem(fmt(meta.get('mcc')))) # MCC
                 self.groups_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('mnc')))) # MNC
                 self.groups_table.setItem(row, 5, QTableWidgetItem(fmt(meta.get('priority')))) # Priority
-                self.groups_table.setItem(row, 6, QTableWidgetItem("")) # Name
+                self.groups_table.setItem(row, 6, QTableWidgetItem(f"Group {gssi}")) # Name (Placeholder)
 
         # Update Users Table (if ISSI present)
         # Columns: ISSI, LO, GSSI, MCC, MNC, Name, Location
@@ -2919,7 +3444,7 @@ class ModernTetraGUI(QMainWindow):
                 self.users_table.setItem(row, 2, QTableWidgetItem(fmt(meta.get('talkgroup_id')))) # GSSI
                 self.users_table.setItem(row, 3, QTableWidgetItem(fmt(meta.get('mcc')))) # MCC
                 self.users_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('mnc')))) # MNC
-                self.users_table.setItem(row, 5, QTableWidgetItem("")) # Name
+                self.users_table.setItem(row, 5, QTableWidgetItem(f"User {issi}")) # Name (Placeholder)
                 
                 # Location
                 loc_data = ""
@@ -2933,56 +3458,60 @@ class ModernTetraGUI(QMainWindow):
         """Handle decoded frame."""
         self.frame_count += 1
         
-        # Update new tables
-        self.update_tables(frame)
-        
-        # Try SDS reassembly first
-        reassembled_sds = self.reassemble_sds_message(frame)
-        if reassembled_sds:
-            frame['sds_message'] = reassembled_sds
-            frame['is_reassembled'] = True
+        # Only update tables if auto-decrypt is enabled
+        # If disabled, we only want to verify signal status (stats)
+        if self.auto_decrypt_cb.isChecked():
+            # Update new tables
+            self.update_tables(frame)
+            
+            # Try SDS reassembly first
+            reassembled_sds = self.reassemble_sds_message(frame)
+            if reassembled_sds:
+                frame['sds_message'] = reassembled_sds
+                frame['is_reassembled'] = True
+        else:
+            # Debug log to verify logic
+            # logger.debug("Skipping table update (Auto-Decrypt disabled)")
+            pass
         
         # Check if this is test data FIRST - don't count test frames for TETRA detection
         is_test = frame.get('is_test_data', False)
         
         # Track TETRA signal detection (only for real frames, not test data)
-        # Also require that we have actual signal power (from signal label)
+        # Count ALL decoded frames as potential TETRA frames (if decoder found them, they're likely TETRA)
         if not is_test:
             import time
-            # Get current signal power
-            signal_text = self.signal_label.text()
-            try:
-                import re
-                power_match = re.search(r'(-?\d+\.?\d*)\s*dB', signal_text)
-                signal_power = float(power_match.group(1)) if power_match else -100
-            except:
-                signal_power = -100
+            # Count all non-test frames as potential TETRA frames
+            # If the decoder found and decoded a frame, it's likely a valid TETRA frame
+            self.tetra_frame_count += 1
             
-            # Only count frames if we have actual signal power above noise floor
-            if signal_power > -60:  # Require signal above noise floor (increased from -80)
-                # Count all non-test frames as potential TETRA frames
-                self.tetra_frame_count += 1
-                
-                # Check for sync position (indicates sync pattern was found)
-                if frame.get('position') is not None:
-                    self.tetra_sync_count += 1
-                
-                # Check for valid CRC (indicates valid frame structure)
-                if frame.get('burst_crc') is True:
-                    self.tetra_valid_frames += 1
-                elif 'burst_crc' not in frame and frame.get('type') is not None:
-                    # Frame was decoded even without explicit CRC - count as valid
-                    self.tetra_valid_frames += 0.5
-                
-                # Update TETRA status every 5 frames or every 2 seconds
-                current_time = time.time()
-                if (self.tetra_frame_count % 5 == 0 or 
-                    current_time - self.last_tetra_update > 2.0):
-                    self.update_tetra_status()
-                    self.last_tetra_update = current_time
+            # Check for sync position (indicates sync pattern was found)
+            if frame.get('position') is not None:
+                self.tetra_sync_count += 1
+            
+            # Check for valid CRC (indicates valid frame structure)
+            if frame.get('burst_crc') is True:
+                self.tetra_valid_frames += 1
+            elif 'burst_crc' not in frame and frame.get('type') is not None:
+                # Frame was decoded even without explicit CRC - count as valid
+                # Having a frame type means the decoder successfully parsed it
+                self.tetra_valid_frames += 0.5
+            
+            # Update TETRA status immediately on first frame, then every 5 frames or every 2 seconds
+            current_time = time.time()
+            if (self.tetra_frame_count == 1 or 
+                self.tetra_frame_count % 5 == 0 or 
+                current_time - self.last_tetra_update > 2.0):
+                self.update_tetra_status()
+                self.last_tetra_update = current_time
         
         if frame.get('decrypted'):
             self.decrypted_count += 1
+        
+        # Don't populate frames table if auto-decrypt/auto-decode is disabled
+        # User only wants to see signal status, not decoded frames
+        if not self.auto_decrypt_cb.isChecked():
+            return
         
         # Check filter before adding
         type_name = frame.get('type_name', "Unknown")
@@ -3093,6 +3622,11 @@ class ModernTetraGUI(QMainWindow):
         self.frames_table.setItem(row, 3, create_item(desc))
         
         enc_text = "Yes" if frame.get('encrypted') else "No"
+        if frame.get('encrypted'):
+            alg = frame.get('encryption_algorithm', '')
+            if alg:
+                enc_text += f" ({alg})"
+        
         enc_color = QColor(255, 100, 100) if frame.get('encrypted') else QColor(100, 255, 100)
         self.frames_table.setItem(row, 4, create_item(enc_text, enc_color))
         
@@ -3104,7 +3638,8 @@ class ModernTetraGUI(QMainWindow):
             status_text = f"✓ Decrypted ({confidence}) | {key_used}"
             status_color = QColor(0, 255, 255)
         elif frame.get('encrypted'):
-            status_text = "🔒 Encrypted"
+            alg = frame.get('encryption_algorithm', 'Unknown')
+            status_text = f"🔒 Encrypted ({alg})"
             status_color = QColor(255, 165, 0)
         else:
             status_text = "Clear"
@@ -3234,6 +3769,50 @@ class ModernTetraGUI(QMainWindow):
     def update_displays(self):
         """Update displays."""
         self.decrypt_label.setText(f"🔒 {self.decrypted_count}/{self.frame_count}")
+        
+        # Update recording status
+        if self.recording_active and self.recording_start_time:
+            duration = datetime.now() - self.recording_start_time
+            seconds = int(duration.total_seconds())
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            secs = seconds % 60
+            
+            size_str = "0 B"
+            if hasattr(self, 'current_wav_file') and os.path.exists(self.current_wav_file):
+                size_bytes = os.path.getsize(self.current_wav_file)
+                if size_bytes > 1024*1024:
+                    size_str = f"{size_bytes/(1024*1024):.1f} MB"
+                else:
+                    size_str = f"{size_bytes/1024:.1f} KB"
+            
+            self.recording_status_label.setText(f"🔴 LIVE | {hours:02}:{minutes:02}:{secs:02} | {size_str}")
+            self.recording_status_label.setStyleSheet("font-weight: bold; padding: 5px; color: #ff0000; background-color: #220000;")
+        else:
+            self.recording_status_label.setText("⚫ Not Recording")
+            self.recording_status_label.setStyleSheet("font-weight: bold; padding: 5px; color: #888888;")
+        
+        # Update recording status
+        if self.recording_active and self.recording_start_time:
+            duration = datetime.now() - self.recording_start_time
+            seconds = int(duration.total_seconds())
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            secs = seconds % 60
+            
+            size_str = "0 B"
+            if hasattr(self, 'current_wav_file') and os.path.exists(self.current_wav_file):
+                size_bytes = os.path.getsize(self.current_wav_file)
+                if size_bytes > 1024*1024:
+                    size_str = f"{size_bytes/(1024*1024):.1f} MB"
+                else:
+                    size_str = f"{size_bytes/1024:.1f} KB"
+            
+            self.recording_status_label.setText(f"🔴 LIVE | {hours:02}:{minutes:02}:{secs:02} | {size_str}")
+            self.recording_status_label.setStyleSheet("font-weight: bold; padding: 5px; color: #ff0000; background-color: #220000;")
+        else:
+            self.recording_status_label.setText("⚫ Not Recording")
+            self.recording_status_label.setStyleSheet("font-weight: bold; padding: 5px; color: #888888;")
     
     def update_tetra_status(self):
         """Update TETRA signal detection status indicator."""
@@ -3250,15 +3829,15 @@ class ModernTetraGUI(QMainWindow):
         
         # More lenient detection criteria for real-world signals
         # If we're decoding frames (even without perfect sync), it's likely TETRA
+        # Lower threshold - if decoder found frames, count them as TETRA
         is_tetra_detected = (
-            self.tetra_frame_count >= 3 and  # At least 3 frames decoded
-            (sync_rate > 0.1 or crc_rate > 0.1)  # At least 10% sync OR CRC
+            self.tetra_frame_count >= 1  # At least 1 frame decoded (very lenient)
         )
         
         # High confidence: multiple frames with good sync/CRC
         high_confidence = (
-            self.tetra_frame_count >= 5 and
-            (sync_rate > 0.3 or crc_rate > 0.3)
+            self.tetra_frame_count >= 3 and
+            (sync_rate > 0.2 or crc_rate > 0.2)  # Lowered from 0.3 to 0.2
         )
         
         if high_confidence:
@@ -3346,12 +3925,12 @@ Examples:
         '''
     )
     
-    parser.add_argument('-f', '--frequency', type=float,
-                        help='Frequency in MHz (e.g., 392.225)')
-    parser.add_argument('-g', '--gain', type=float, default=25.0,
-                        help='RF gain in dB (default: 25.0, or "auto")')
-    parser.add_argument('-s', '--sample-rate', type=float, default=1.8,
-                        help='Sample rate in MHz (default: 1.8)')
+    parser.add_argument('-f', '--frequency', type=float, default=390.865,
+                        help='Frequency in MHz (default: 390.865)')
+    parser.add_argument('-g', '--gain', type=float, default=50.0,
+                        help='RF gain in dB (default: 50.0)')
+    parser.add_argument('-s', '--sample-rate', type=float, default=2.4,
+                        help='Sample rate in MHz (default: 2.4)')
     parser.add_argument('--auto-start', action='store_true',
                         help='Automatically start capture on launch')
     parser.add_argument('-m', '--monitor-audio', action='store_true',
@@ -3388,9 +3967,15 @@ Examples:
         start_freq = args.scan[0] * 1e6
         stop_freq = args.scan[1] * 1e6
         
-        rtl = RTLCapture(frequency=start_freq, sample_rate=1.8e6, gain='auto')
+        rtl = RTLCapture(frequency=start_freq, sample_rate=2.4e6, gain=50)
         if rtl.open():
-            scanner = FrequencyScanner(rtl, scan_step=25e3)
+            scanner = FrequencyScanner(
+                rtl, 
+                sample_rate=2.4e6,
+                scan_step=25e3,
+                noise_floor=-45,  # Default noise floor
+                bottom_threshold=-85  # Default bottom threshold
+            )
             results = []
             
             print(f"\nScanning {args.scan[0]:.3f} - {args.scan[1]:.3f} MHz...")
@@ -3426,16 +4011,18 @@ Examples:
         window.freq_input.setText(f"{args.frequency:.3f}")
         logger.info(f"Set frequency to {args.frequency:.3f} MHz")
     
-    if args.gain != 25.0:
+    if args.gain != 50.0:
         # Convert gain to slider value (0-100 = 0-50 dB)
         slider_val = int(args.gain * 2)
         window.gain_slider.setValue(slider_val)
         logger.info(f"Set gain to {args.gain:.1f} dB")
     
-    if args.sample_rate != 1.8:
-        # Convert sample rate to slider value
-        if args.sample_rate == 2.4:
-            window.sample_rate_slider.setValue(6)
+    if args.sample_rate != 2.4:
+        # Convert sample rate to slider value (0 = 1.8 MHz, 6 = 2.4 MHz)
+        # Formula: slider_value = (sample_rate - 1.8) / 0.1
+        slider_val = int((args.sample_rate - 1.8) / 0.1)
+        slider_val = max(0, min(6, slider_val))  # Clamp to valid range
+        window.sample_rate_slider.setValue(slider_val)
         logger.info(f"Set sample rate to {args.sample_rate:.1f} MHz")
     
     if args.monitor_audio:
