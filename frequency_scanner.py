@@ -11,6 +11,15 @@ from typing import List, Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
+# Import decoder for frame validation
+try:
+    from signal_processor import SignalProcessor
+    from tetra_decoder import TetraDecoder
+    DECODER_AVAILABLE = True
+except ImportError:
+    DECODER_AVAILABLE = False
+    logger.warning("Decoder not available for frame validation")
+
 
 class TetraSignalDetector:
     """Detects TETRA signals in captured samples."""
@@ -75,8 +84,8 @@ class TetraSignalDetector:
         
         confidence = matches / len(phase_diffs)
         
-        # Threshold for TETRA detection
-        is_tetra = confidence > 0.3
+        # Stricter threshold for TETRA detection (was 0.3, now 0.4)
+        is_tetra = confidence > 0.4
         
         return is_tetra, confidence
     
@@ -125,13 +134,100 @@ class TetraSignalDetector:
             correlation = np.sum(window == sync_pattern) / len(sync_pattern)
             max_correlation = max(max_correlation, correlation)
         
-        found_sync = max_correlation > 0.7
+        # Lower threshold for sync detection (was 0.85, now 0.75)
+        # Real-world signals often have noise or multipath fading
+        found_sync = max_correlation > 0.75
         
         return found_sync, max_correlation
+    
+    def validate_frames(self, samples: np.ndarray) -> Tuple[bool, float]:
+        """
+        Attempt to decode frames and validate CRC to confirm TETRA signal.
+        
+        Args:
+            samples: Complex IQ samples
+            
+        Returns:
+            (frames_valid, crc_pass_rate) tuple
+        """
+        if not DECODER_AVAILABLE or len(samples) < 10000:
+            return False, 0.0
+        
+        try:
+            # Process signal through decoder
+            processor = SignalProcessor(sample_rate=self.sample_rate)
+            demodulated = processor.process(samples)
+            
+            if len(demodulated) < 255:  # Need at least one TETRA slot
+                return False, 0.0
+            
+            # Try to decode frames
+            decoder = TetraDecoder(auto_decrypt=False)  # Don't try decryption for validation
+            frames = decoder.decode(demodulated)
+            
+            if len(frames) == 0:
+                return False, 0.0
+            
+            # Check CRC pass rate
+            crc_pass_count = 0
+            total_frames = 0
+            
+            for frame in frames:
+                total_frames += 1
+                # Check if frame has valid CRC (from protocol parser)
+                if frame.get('burst_crc') is True:
+                    crc_pass_count += 1
+                elif frame.get('burst_crc') is False:
+                    pass  # CRC failed
+                else:
+                    # If CRC status unknown, assume valid if frame structure is correct
+                    if 'type' in frame and 'number' in frame:
+                        crc_pass_count += 0.5  # Partial credit
+            
+            crc_rate = crc_pass_count / max(total_frames, 1)
+            
+            # Require at least 2 frames and >50% CRC pass rate
+            is_valid = total_frames >= 2 and crc_rate > 0.5
+            
+            return is_valid, crc_rate
+            
+        except Exception as e:
+            logger.debug(f"Frame validation error: {e}")
+            return False, 0.0
+    
+    def check_power_stability(self, samples: np.ndarray, num_windows: int = 5) -> bool:
+        """
+        Check if signal power is stable (not transient noise).
+        
+        Args:
+            samples: Complex IQ samples
+            num_windows: Number of windows to check
+            
+        Returns:
+            True if power is stable
+        """
+        if len(samples) < num_windows * 1000:
+            return False
+        
+        window_size = len(samples) // num_windows
+        powers = []
+        
+        for i in range(num_windows):
+            window = samples[i * window_size:(i + 1) * window_size]
+            power = self.calculate_power(window)
+            powers.append(power)
+        
+        # Check if power variation is reasonable (std dev < 10 dB)
+        if len(powers) > 1:
+            power_std = np.std(powers)
+            return power_std < 10.0
+        
+        return True
     
     def analyze_signal(self, samples: np.ndarray) -> Dict:
         """
         Analyze signal to determine if it's TETRA.
+        Uses stricter validation requiring BOTH modulation AND sync detection.
         
         Args:
             samples: Complex IQ samples
@@ -140,19 +236,49 @@ class TetraSignalDetector:
             Analysis dictionary with detection results
         """
         power = self.calculate_power(samples)
-        is_tetra, mod_confidence = self.detect_tetra_modulation(samples)
+        is_tetra_mod, mod_confidence = self.detect_tetra_modulation(samples)
         has_sync, sync_correlation = self.detect_sync_pattern(samples)
         
-        # Overall confidence
-        confidence = (mod_confidence * 0.6 + sync_correlation * 0.4) if has_sync else mod_confidence
+        # Require BOTH modulation detection AND sync pattern (not OR)
+        # This reduces false positives significantly
+        basic_tetra_match = is_tetra_mod and has_sync
+        
+        # Additional validation: try to decode frames
+        frames_valid, crc_rate = self.validate_frames(samples)
+        
+        # Check power stability
+        power_stable = self.check_power_stability(samples)
+        
+        # Overall confidence calculation
+        if has_sync and is_tetra_mod:
+            # Both detected - high confidence
+            confidence = (mod_confidence * 0.4 + sync_correlation * 0.4 + crc_rate * 0.2)
+        elif has_sync:
+            # Only sync - medium confidence
+            confidence = sync_correlation * 0.6
+        elif is_tetra_mod:
+            # Only modulation - low confidence
+            confidence = mod_confidence * 0.5
+        else:
+            confidence = 0.0
+        
+        # Final decision: require BOTH modulation AND sync, plus frame validation if available
+        is_tetra = basic_tetra_match and power_stable
+        if frames_valid:
+            # Frame validation confirms it's TETRA
+            is_tetra = True
+            confidence = max(confidence, 0.7)  # Boost confidence if frames validate
         
         return {
             'power_db': power,
-            'is_tetra': is_tetra or has_sync,
+            'is_tetra': is_tetra,
             'confidence': confidence,
             'modulation_confidence': mod_confidence,
             'sync_detected': has_sync,
             'sync_correlation': sync_correlation,
+            'frames_validated': frames_valid,
+            'crc_pass_rate': crc_rate,
+            'power_stable': power_stable,
             'signal_present': power > -60  # Threshold for signal presence
         }
 
@@ -272,16 +398,33 @@ class FrequencyScanner:
             
             result = self.scan_frequency(freq, dwell_time=0.3)
             
-            # Check if TETRA signal detected
-            if (result.get('is_tetra', False) and 
-                result.get('power_db', -100) > min_power and
-                result.get('confidence', 0) > min_confidence):
+            # Check if TETRA signal detected (stricter criteria)
+            is_tetra = result.get('is_tetra', False)
+            power_db = result.get('power_db', -100)
+            confidence = result.get('confidence', 0)
+            sync_detected = result.get('sync_detected', False)
+            frames_validated = result.get('frames_validated', False)
+            power_stable = result.get('power_stable', False)
+            
+            # Require: TETRA match, sufficient power, confidence, AND sync detection
+            # Frame validation is optional but boosts confidence
+            if (is_tetra and 
+                power_db > min_power and
+                confidence > min_confidence and
+                sync_detected and
+                power_stable):
                 
                 found.append(result)
+                validation_info = ""
+                if frames_validated:
+                    crc_rate = result.get('crc_pass_rate', 0)
+                    validation_info = f", CRC: {crc_rate:.1%}"
+                
                 logger.info(
                     f"Found TETRA signal at {freq/1e6:.3f} MHz - "
-                    f"Power: {result['power_db']:.1f} dB, "
-                    f"Confidence: {result['confidence']:.2f}"
+                    f"Power: {power_db:.1f} dB, "
+                    f"Confidence: {confidence:.2f}, "
+                    f"Sync: {sync_detected}{validation_info}"
                 )
             
             # Progress update

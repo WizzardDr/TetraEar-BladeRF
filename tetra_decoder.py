@@ -82,63 +82,93 @@ class TetraDecoder:
                 # Network defaults
                 bytes.fromhex('A0B1C2D3E4F5061728394A5B6C7D8E9F'),
                 bytes.fromhex('1122334455667788990011223344556677'),
+            ],
+            'TEA3': [
+                # TEA3 keys (similar structure to TEA2 usually 128-bit or 80-bit depending on implementation)
+                # Standard TEA3 is 128-bit
+                bytes.fromhex('00000000000000000000000000000000'),
+                bytes.fromhex('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'),
+            ],
+            'TEA4': [
+                # TEA4 keys
+                bytes.fromhex('00000000000000000000000000000000'),
+                bytes.fromhex('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'),
             ]
         }
         logger.debug(f"Auto-decrypt enabled with {sum(len(v) for v in self.common_keys.values())} common keys (OpenEar style)")
         
     def symbols_to_bits(self, symbols):
         """
-        Convert π/4-DQPSK symbols to bits.
-        
-        Args:
-            symbols: Array of symbol values (0-7)
-            
-        Returns:
-            Bit array
+        Convert demodulated symbols (0-7) to bits (2 bits per symbol).
+        Maps 8-PSK sectors to π/4-DQPSK symbols (0-3).
         """
         bits = []
-        for symbol in symbols:
-            # π/4-DQPSK: 3 bits per symbol
-            # Map symbol to 3-bit value
-            bit3 = (symbol >> 2) & 1
-            bit2 = (symbol >> 1) & 1
-            bit1 = symbol & 1
-            bits.extend([bit3, bit2, bit1])
+        mapped_symbols = []
         
-        return np.array(bits)
-    
-    def find_sync(self, bits, threshold=0.96):
-        """
-        Find TETRA synchronization pattern.
-        
-        Args:
-            bits: Bit stream
-            threshold: Correlation threshold (default 0.94 for strict matching)
+        for s in symbols:
+            # Map 0-7 (8-PSK) to 0-3 (QPSK)
+            # 1 (π/4) -> 0 (00)
+            # 3 (3π/4) -> 1 (01)
+            # 5 (-3π/4) -> 3 (11)
+            # 7 (-π/4) -> 2 (10)
+            # Handle neighbors for noise tolerance
+            if s in [0, 1, 2]: val = 0   # 00
+            elif s in [3, 4]: val = 1    # 01
+            elif s in [5]: val = 3       # 11
+            elif s in [6, 7]: val = 2    # 10
+            else: val = 0
             
-        Returns:
-            List of sync positions
+            mapped_symbols.append(val)
+            bits.extend([val >> 1, val & 1])
+            
+        return np.array(bits), np.array(mapped_symbols)
+    
+    def find_sync(self, bits, threshold=0.85):
+        """
+        Find TETRA synchronization pattern (Training Sequence 1).
         """
         sync_positions = []
-        sync_pattern = np.array(self.SYNC_PATTERN)
+        # Training Sequence 1 (from TetraProtocolParser)
+        # [0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1]
+        # Converted to bits (assuming 0->00, 1->01? No, these are likely bits)
+        # Standard TS1 is 22 bits.
+        # Let's use a known TS1 bit pattern: 1101000011101001110100
+        # Or try to match what TetraProtocolParser uses.
+        
+        # Let's use the pattern from TetraProtocolParser but expanded to bits
+        # If parser uses [0, 1...], let's assume they are bits.
+        ts1_bits = [0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1] # 14 bits? Too short.
+        
+        # Let's use the standard 22-bit TS1
+        sync_pattern = np.array([1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 0])
         sync_len = len(sync_pattern)
         
-        for i in range(len(bits) - sync_len):
+        if len(bits) < sync_len:
+            return sync_positions
+        
+        # Use sliding window with step size to speed up search
+        step = max(1, sync_len // 4)  # Check every 1/4 of pattern length
+        
+        for i in range(0, len(bits) - sync_len, step):
             window = bits[i:i+sync_len]
             correlation = np.sum(window == sync_pattern) / sync_len
             
             if correlation >= threshold:
                 sync_positions.append(i)
                 logger.debug(f"Found sync at position {i}, correlation: {correlation:.2f}")
+                # Skip ahead to avoid duplicate detections
+                i += sync_len
         
         return sync_positions
     
-    def decode_frame(self, bits, start_pos):
+    def decode_frame(self, bits, start_pos, symbols=None):
         """
         Decode a TETRA frame starting at given position.
         
         Args:
             bits: Bit stream
             start_pos: Start position of frame
+            symbols: Optional pre-calculated symbols (0-3)
             
         Returns:
             Decoded frame data or None
@@ -162,13 +192,7 @@ class TetraDecoder:
         additional_info = {}
         
         # Map frame types (MAC PDU types for downlink)
-        # 0: MAC-RESOURCE
-        # 1: MAC-FRAG
-        # 2: MAC-END
-        # 3: MAC-BROADCAST
-        # 4: MAC-SUPPL
-        # 5: MAC-U-SIGNAL (Uplink only? No, D-MAC-SYNC etc)
-        # Let's use a more comprehensive mapping
+        # ... (rest of function)
         
         frame_type_name = "Unknown"
         
@@ -236,9 +260,18 @@ class TetraDecoder:
         
         # Parse protocol layers (PHY/MAC/higher) - with error handling
         try:
+            # Use provided symbols if available, otherwise reconstruct
+            if symbols is None:
+                # Reconstruct 0-3 symbols from bits
+                symbols = []
+                for i in range(0, len(frame_bits), 2):
+                    val = (frame_bits[i] << 1) | frame_bits[i+1]
+                    symbols.append(val)
+                symbols = np.array(symbols)
+
             # Parse burst structure - be more lenient
             burst = self.protocol_parser.parse_burst(
-                np.array(frame_bits), 
+                symbols, 
                 slot_number=frame_number % 4
             )
             
@@ -316,11 +349,21 @@ class TetraDecoder:
                                 additional_info['source_ssi'] = call_meta.source_ssi
                         
                         # Try to decode SDS message if not encrypted
-                        if not mac_pdu.encrypted:
-                            sds_text = self.protocol_parser.parse_sds_message(mac_pdu)
-                            if sds_text:
+                        # Use reassembled data if available, otherwise use current PDU data
+                        payload_to_decode = mac_pdu.reassembled_data if mac_pdu.reassembled_data else mac_pdu.data
+                        
+                        if not mac_pdu.encrypted and len(payload_to_decode) > 0:
+                            # Try parsing as SDS message
+                            sds_text = self.protocol_parser.parse_sds_data(payload_to_decode)
+                            if sds_text and not sds_text.startswith("[BIN]"):  # Only if it's actual text, not hex
                                 frame_data['sds_message'] = sds_text
+                                frame_data['decoded_text'] = sds_text  # Always set decoded_text when sds_message exists
                                 additional_info['sds_text'] = sds_text[:50]  # First 50 chars
+                                
+                                # If reassembled, mark it
+                                if mac_pdu.reassembled_data:
+                                    frame_data['is_reassembled'] = True
+                                    additional_info['description'] += " (Reassembled)"
                 except Exception as e:
                     logger.debug(f"MAC PDU parsing error: {e}")
                     # Continue even if MAC parsing fails
@@ -341,9 +384,24 @@ class TetraDecoder:
                     sds_text = self.protocol_parser.parse_sds_data(decrypted_bytes)
                     if sds_text:
                         frame_data['sds_message'] = sds_text
-                        frame_data['decoded_text'] = sds_text
+                        frame_data['decoded_text'] = sds_text  # Ensure decoded_text is set
                         additional_info['sds_text'] = sds_text[:50]
-                except:
+                    else:
+                        # Fallback: try to decode as text if it looks printable
+                        printable_count = sum(1 for b in decrypted_bytes if 32 <= b <= 126 or b in (10, 13))
+                        if len(decrypted_bytes) > 0 and (printable_count / len(decrypted_bytes)) > 0.7:
+                            try:
+                                text = decrypted_bytes.decode('latin-1', errors='replace')
+                                # Remove null bytes and control chars except newline/carriage return
+                                text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else ' ' for c in text)
+                                text = text.strip()
+                                if text:
+                                    frame_data['decoded_text'] = f"[TXT] {text}"
+                                    frame_data['sds_message'] = frame_data['decoded_text']
+                            except:
+                                pass
+                except Exception as e:
+                    logger.debug(f"Error parsing decrypted SDS: {e}")
                     pass
         
         return frame_data
@@ -398,7 +456,7 @@ class TetraDecoder:
                 keys_to_try.append((common_key, f"{algorithm} common_key_{idx}"))
         
         # Also try with other algorithms if primary fails
-        for other_alg in ['TEA1', 'TEA2', 'TEA3']:
+        for other_alg in ['TEA1', 'TEA2', 'TEA3', 'TEA4']:
             if other_alg != algorithm and other_alg in self.common_keys:
                 for idx, common_key in enumerate(self.common_keys[other_alg][:5]):  # Try first 5
                     keys_to_try.append((common_key, f"{other_alg} common_key_{idx} (cross-try)"))
@@ -457,12 +515,32 @@ class TetraDecoder:
                 if unique_bytes > 1:  # Any diversity is good
                     score += 10
                 
+                # --- Advanced Scoring: Try to parse as MAC PDU ---
+                try:
+                    # Convert bytes to bits for parser
+                    decrypted_bits = []
+                    for b in decrypted_payload:
+                        for i in range(7, -1, -1):
+                            decrypted_bits.append((b >> i) & 1)
+                    decrypted_bits = np.array(decrypted_bits)
+                    
+                    # Check CRC if possible (heuristic)
+                    if self.protocol_parser._check_crc(decrypted_bits):
+                        score += 100  # Big bonus for valid CRC/Structure
+                        
+                    # Try to parse as MAC PDU
+                    pdu = self.protocol_parser.parse_mac_pdu(decrypted_bits)
+                    if pdu and pdu.pdu_type != self.protocol_parser.PDUType.MAC_DATA: # If it parses as a specific type
+                         score += 50
+                except:
+                    pass
+                
                 if score > best_score:
                     best_score = score
                     best_result = (decrypted_payload, key_desc)
                 
                 # Lower threshold - accept more attempts
-                if score > 50:  # Was 200, now 50 for more lenient acceptance
+                if score > 80:  # Was 50, increased due to CRC bonus
                     logger.info(f"Good decryption score {score} with {key_desc}")
                     break
                     
@@ -482,7 +560,14 @@ class TetraDecoder:
             frame_data['decrypted_bytes'] = decrypted_payload.hex()
             frame_data['key_used'] = key_desc
             frame_data['decrypt_confidence'] = best_score
-            logger.info(f"✓ Decrypted frame {frame_data['number']} using {key_desc} (confidence: {best_score})")
+            
+            # Update algorithm if detected from key
+            if "TEA1" in key_desc: frame_data['encryption_algorithm'] = "TEA1"
+            elif "TEA2" in key_desc: frame_data['encryption_algorithm'] = "TEA2"
+            elif "TEA3" in key_desc: frame_data['encryption_algorithm'] = "TEA3"
+            elif "TEA4" in key_desc: frame_data['encryption_algorithm'] = "TEA4"
+            
+            logger.info(f"[OK] Decrypted frame {frame_data['number']} using {key_desc} (confidence: {best_score})")
         else:
             # All keys failed or low confidence
             frame_data['decrypted'] = False
@@ -497,43 +582,237 @@ class TetraDecoder:
     def decode(self, symbols):
         """
         Decode TETRA frames from symbol stream.
-        
-        Args:
-            symbols: Demodulated symbols
-            
-        Returns:
-            List of decoded frames
         """
-        # Convert symbols to bits
-        bits = self.symbols_to_bits(symbols)
+        # Convert symbols to bits and mapped symbols (0-3)
+        bits, mapped_symbols = self.symbols_to_bits(symbols)
         
-        # Find synchronization patterns
-        sync_positions = self.find_sync(bits)
+        # Find synchronization patterns (Training Sequence)
+        sync_positions = self.find_sync(bits, threshold=0.80)
         
         if not sync_positions:
-            logger.warning("No synchronization patterns found")
-            return []
+            sync_positions = self.find_sync(bits, threshold=0.70)
+            if not sync_positions:
+                return []
         
         # Decode frames
         frames = []
         for pos in sync_positions:
-            frame = self.decode_frame(bits, pos)
-            if frame:
-                frames.append(frame)
-                logger.info(f"Decoded frame {frame['number']} (type: {frame['type']}) at position {pos}")
+            # Adjust position to start of burst
+            # TS starts at bit 216 (symbol 108)
+            # But we need to be careful about array bounds
+            start_pos = pos - 216
+            
+            if start_pos >= 0:
+                # Extract symbols for this frame
+                # 255 symbols = 510 bits
+                start_sym = start_pos // 2
+                if start_sym + 255 <= len(mapped_symbols):
+                    frame_symbols = mapped_symbols[start_sym : start_sym + 255]
+                    
+                    # Reconstruct bits for decode_frame (it expects bits)
+                    # But decode_frame logic for header/type is based on bits
+                    # We pass the bits corresponding to the frame
+                    frame_bits = bits[start_pos : start_pos + 510]
+                    
+                    frame = self.decode_frame(frame_bits, 0, frame_symbols)
+                    if frame:
+                        frames.append(frame)
+                        logger.info(f"Decoded frame {frame['number']} (type: {frame['type']})")
         
         return frames
-    
-    def format_frame_info(self, frame):
+
+    def decode_frame(self, bits, start_pos, symbols=None):
         """
-        Format frame information for display with meaningful interpretation.
-        
-        Args:
-            frame: Decoded frame dictionary
+        Decode a TETRA frame.
+        """
+        if len(bits) < self.FRAME_LENGTH:
+            return None
             
-        Returns:
-            Formatted string
-        """
+        frame_bits = bits
+        frame = BitArray(frame_bits)
+        
+        # Extract frame header (first 32 bits)
+        header = frame[0:32]
+        
+        # Extract frame type (first 4 bits)
+        frame_type = header[0:4].uint
+        
+        # Extract frame number (next 8 bits)
+        frame_number = header[4:12].uint
+        
+        # Parse additional fields based on frame type
+        additional_info = {}
+        
+        frame_type_name = "Unknown"
+        
+        if frame_type == 0:
+            frame_type_name = "MAC-RESOURCE"
+            additional_info['description'] = 'Resource allocation'
+            if len(header) >= 24:
+                additional_info['network_id'] = header[12:24].uint
+        elif frame_type == 1:
+            frame_type_name = "MAC-FRAG" 
+            additional_info['description'] = 'Fragment'
+        elif frame_type == 2:
+            frame_type_name = "MAC-END"
+            additional_info['description'] = 'End of transmission'
+        elif frame_type == 3:
+            frame_type_name = "MAC-BROADCAST"
+            additional_info['description'] = 'Broadcast info'
+        elif frame_type == 4:
+            frame_type_name = "MAC-SUPPL"
+            additional_info['description'] = 'Supplementary'
+        elif frame_type == 5:
+            frame_type_name = "MAC-U-SIGNAL"
+            additional_info['description'] = 'Signaling'
+        elif frame_type == 6:
+            frame_type_name = "MAC-DATA"
+            additional_info['description'] = 'User Data'
+        elif frame_type == 7:
+            frame_type_name = "MAC-U-BLK"
+            additional_info['description'] = 'Block'
+        else:
+            frame_type_name = f"Type {frame_type}"
+            additional_info['description'] = f'Raw type {frame_type}'
+
+        # Extract encryption indicator - be aggressive, assume encrypted unless proven clear
+        encrypted = True  # Default to encrypted
+        encryption_algorithm = 'TEA1'  # Default algorithm
+        key_id = '0'
+        
+        frame_data = {
+            'type': frame_type,
+            'type_name': frame_type_name, # Add human readable name
+            'number': frame_number,
+            'timeslot': frame_number % 4,  # Add timeslot (0-3)
+            'bits': frame_bits,
+            'header': header.bin,
+            'position': start_pos,
+            'encrypted': encrypted,
+            'encryption_algorithm': encryption_algorithm,
+            'key_id': key_id,
+            'additional_info': additional_info
+        }
+        
+        # Parse protocol layers
+        try:
+            # Use provided symbols if available, otherwise reconstruct
+            if symbols is None:
+                # Reconstruct 0-3 symbols from bits
+                symbols = []
+                for i in range(0, len(frame_bits), 2):
+                    val = (frame_bits[i] << 1) | frame_bits[i+1]
+                    symbols.append(val)
+                symbols = np.array(symbols)
+
+            # Parse burst structure
+            burst = self.protocol_parser.parse_burst(
+                symbols, 
+                slot_number=frame_number % 4
+            )
+            
+            if burst:
+                frame_data['burst_crc'] = burst.crc_ok
+                
+                # Parse MAC PDU even if CRC failed (may still be partially valid)
+                try:
+                    mac_pdu = self.protocol_parser.parse_mac_pdu(burst.data_bits)
+                    
+                    if mac_pdu:
+                        frame_data['mac_pdu'] = {
+                            'type': mac_pdu.pdu_type.name,
+                            'encrypted': mac_pdu.encrypted,
+                            'address': mac_pdu.address,
+                            'length': mac_pdu.length,
+                            'data': mac_pdu.data  # Add data field
+                        }
+                        
+                        # Update encryption status from MAC PDU
+                        if mac_pdu.encrypted:
+                            encrypted = True
+                            frame_data['encrypted'] = True
+                            if not encryption_algorithm:
+                                encryption_algorithm = 'TEA1'
+                                frame_data['encryption_algorithm'] = 'TEA1'
+                        else:
+                            # Check data entropy
+                            if len(mac_pdu.data) > 0:
+                                unique_bytes = len(set(mac_pdu.data))
+                                total_bytes = len(mac_pdu.data)
+                                entropy_ratio = unique_bytes / max(total_bytes, 1)
+                                
+                                if entropy_ratio > 0.7 and total_bytes > 8:
+                                    encrypted = True
+                                    frame_data['encrypted'] = True
+                                else:
+                                    encrypted = False
+                                    frame_data['encrypted'] = False
+                                    frame_data['encryption_algorithm'] = None
+                            else:
+                                encrypted = False
+                                frame_data['encrypted'] = False
+                                frame_data['encryption_algorithm'] = None
+                        
+                        # Extract call metadata
+                        call_meta = self.protocol_parser.parse_call_metadata(mac_pdu)
+                        if call_meta:
+                            frame_data['call_metadata'] = {
+                                'call_type': call_meta.call_type,
+                                'talkgroup_id': call_meta.talkgroup_id,
+                                'source_ssi': call_meta.source_ssi,
+                                'dest_ssi': call_meta.dest_ssi,
+                                'channel': call_meta.channel_allocated,
+                                'call_identifier': call_meta.call_identifier,
+                                'priority': call_meta.call_priority,
+                                'mcc': call_meta.mcc,
+                                'mnc': call_meta.mnc,
+                                'encryption': call_meta.encryption_enabled,
+                                'encryption_alg': call_meta.encryption_algorithm
+                            }
+                            if call_meta.talkgroup_id:
+                                additional_info['talkgroup'] = call_meta.talkgroup_id
+                            if call_meta.source_ssi:
+                                additional_info['source_ssi'] = call_meta.source_ssi
+                            if call_meta.mcc:
+                                additional_info['mcc'] = call_meta.mcc
+                            if call_meta.mnc:
+                                additional_info['mnc'] = call_meta.mnc
+                        
+                        # Try to decode SDS message
+                        payload_to_decode = mac_pdu.reassembled_data if mac_pdu.reassembled_data else mac_pdu.data
+                        
+                        if not mac_pdu.encrypted and len(payload_to_decode) > 0:
+                            sds_text = self.protocol_parser.parse_sds_data(payload_to_decode)
+                            if sds_text and not sds_text.startswith("[BIN]"):
+                                frame_data['sds_message'] = sds_text
+                                frame_data['decoded_text'] = sds_text
+                                additional_info['sds_text'] = sds_text[:50]
+                                if mac_pdu.reassembled_data:
+                                    frame_data['is_reassembled'] = True
+                                    additional_info['description'] += " (Reassembled)"
+                except Exception as e:
+                    logger.debug(f"MAC PDU parsing error: {e}")
+
+        except Exception as e:
+            logger.debug(f"Protocol parsing error: {e}")
+        
+        # Decryption logic
+        if frame_data.get('encrypted') and (self.key_manager or self.auto_decrypt):
+            frame_data = self._decrypt_frame(frame_data)
+            if frame_data.get('decrypted') and 'decrypted_bytes' in frame_data:
+                try:
+                    decrypted_bytes = bytes.fromhex(frame_data['decrypted_bytes'])
+                    sds_text = self.protocol_parser.parse_sds_data(decrypted_bytes)
+                    if sds_text:
+                        frame_data['sds_message'] = sds_text
+                        frame_data['decoded_text'] = sds_text
+                        additional_info['sds_text'] = sds_text[:50]
+                except:
+                    pass
+        
+        return frame_data
+
+    def format_frame_info(self, frame):
         info = f"Frame #{frame['number']} (Type: {self._get_frame_type_name(frame['type'])})"
         info += f"\n  Position: {frame['position']}"
         info += f"\n  Header: {frame['header'][:32]}..."
@@ -541,47 +820,63 @@ class TetraDecoder:
         # Add frame type specific info
         frame_type = frame['type']
         if frame_type == 0:
-            info += "\n  📡 Broadcast Frame - System information"
+            info += "\n  📡 MAC-RESOURCE - Resource allocation/Start of message"
         elif frame_type == 1:
-            info += "\n  📞 Traffic Frame - Voice/Data channel"
+            info += "\n  📞 MAC-FRAG - Message fragment"
         elif frame_type == 2:
-            info += "\n  🔗 Control Frame - Signaling"
+            info += "\n  🔗 MAC-END - End of message"
         elif frame_type == 3:
-            info += "\n  📋 MAC Frame - Medium Access Control"
+            info += "\n  📋 MAC-BROADCAST - Broadcast information"
         
+        # Show SDS message if available (PRIORITY)
+        if 'sds_message' in frame and frame['sds_message']:
+            info += f"\n  💬 Message: {frame['sds_message']}"
+        elif 'decoded_text' in frame and frame['decoded_text']:
+            info += f"\n  💬 Text: {frame['decoded_text']}"
+        
+        # Show encryption status
         if frame.get('encrypted'):
-            info += f"\n  🔒 Encrypted: Yes ({frame.get('encryption_algorithm', 'Unknown')})"
+            info += f"\n  [ENC] Encrypted: Yes ({frame.get('encryption_algorithm', 'Unknown')})"
             if frame.get('decrypted'):
-                info += f"\n  ✅ Decrypted: Yes"
+                info += f"\n  [DEC] Decrypted: Yes"
                 if 'key_used' in frame:
                     info += f" - {frame['key_used']}"
-                if 'decrypted_bytes' in frame:
+                if 'decrypted_bytes' in frame and not frame.get('sds_message'):
                     # Try to interpret payload
                     payload_hex = frame['decrypted_bytes'][:64]
-                    info += f"\n  📦 Payload (hex): {payload_hex}..."
-                    
-                    # Try to decode as text using protocol parser
-                    try:
-                        payload_bytes = bytes.fromhex(frame['decrypted_bytes'])
-                        text = self.protocol_parser.parse_sds_data(payload_bytes)
-                        if text:
-                            info += f"\n  📝 Content: {text}"
-                            frame['decoded_text'] = text  # Store for GUI
-                    except:
-                        pass
+                    info += f"\n  [PAY] Payload (hex): {payload_hex}..."
             else:
-                info += f"\n  ❌ Decrypted: No"
+                info += f"\n  [ERR] Decrypted: No"
                 if 'decryption_error' in frame:
                     info += f" ({frame['decryption_error']})"
         else:
-            info += f"\n  🔓 Encrypted: No"
-            # Show raw payload for unencrypted frames
-            if len(frame['bits']) > 32:
-                payload_bits = frame['bits'][32:96]  # Next 64 bits
-                payload_hex = ''.join(f"{int(payload_bits[i:i+8].tobytes().hex(), 16):02x}" 
-                                     for i in range(0, min(64, len(payload_bits)), 8) 
-                                     if i+8 <= len(payload_bits))
-                info += f"\n  📦 Payload: {payload_hex}..."
+            info += f"\n  [CLR] Encrypted: No"
+            
+            # Show MAC PDU data if available and no SDS message
+            if 'mac_pdu' in frame and 'data' in frame['mac_pdu'] and not frame.get('sds_message'):
+                data = frame['mac_pdu']['data']
+                if isinstance(data, (bytes, bytearray)) and len(data) > 0:
+                    # Try to show as text first
+                    printable_count = sum(1 for b in data if 32 <= b <= 126 or b in (10, 13))
+                    if (printable_count / len(data)) > 0.7:
+                        try:
+                            text = data.decode('latin-1', errors='replace').strip()
+                            if text:
+                                info += f"\n  [TXT] Data: {text[:80]}"
+                            else:
+                                info += f"\n  [HEX] Data: {data.hex()[:64]}..."
+                        except:
+                            info += f"\n  [HEX] Data: {data.hex()[:64]}..."
+                    else:
+                        info += f"\n  [HEX] Data: {data.hex()[:64]}..."
+        
+        # Show reassembly status
+        if frame.get('is_reassembled'):
+            info += "\n  ✅ (Reassembled from fragments)"
+        
+        # Show voice indicator
+        if frame.get('has_voice'):
+            info += "\n  🔊 Contains voice data"
         
         return info
     

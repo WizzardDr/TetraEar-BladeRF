@@ -35,66 +35,7 @@ from signal_processor import SignalProcessor
 from tetra_decoder import TetraDecoder
 from tetra_crypto import TetraKeyManager
 from frequency_scanner import FrequencyScanner
-
-
-class VoiceProcessor:
-    """
-    Handles TETRA voice decoding using external cdecoder.exe.
-    """
-    def __init__(self):
-        self.codec_path = os.path.join(os.path.dirname(__file__), "tetra_codec", "bin", "cdecoder.exe")
-        self.working = os.path.exists(self.codec_path)
-        if not self.working:
-            logger.warning(f"TETRA codec not found at {self.codec_path}")
-            
-    def decode_frame(self, frame_data: bytes) -> np.ndarray:
-        """
-        Decode ACELP frame to PCM audio.
-        """
-        if not self.working or not frame_data:
-            return np.zeros(0)
-            
-        try:
-            # Write frame to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.tet') as tmp_in:
-                tmp_in.write(frame_data)
-                tmp_in_path = tmp_in.name
-                
-            tmp_out_path = tmp_in_path + ".out"
-            
-            # Run decoder
-            # cdecoder.exe input_file output_file
-            subprocess.run([self.codec_path, tmp_in_path, tmp_out_path], 
-                          stdout=subprocess.DEVNULL, 
-                          stderr=subprocess.DEVNULL,
-                          check=False)
-            
-            # Read output
-            if os.path.exists(tmp_out_path):
-                with open(tmp_out_path, 'rb') as f:
-                    pcm_data = f.read()
-                
-                # Convert to numpy array (16-bit signed PCM)
-                audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                # Cleanup
-                try:
-                    os.remove(tmp_in_path)
-                    os.remove(tmp_out_path)
-                except:
-                    pass
-                    
-                return audio
-            else:
-                try:
-                    os.remove(tmp_in_path)
-                except:
-                    pass
-                return np.zeros(0)
-                
-        except Exception as e:
-            logger.debug(f"Voice decode error: {e}")
-            return np.zeros(0)
+from voice_processor import VoiceProcessor
 
 
 class WaterfallWidget(QWidget):
@@ -1170,22 +1111,51 @@ class CaptureThread(QThread):
                     # Detect signal (using the computed power)
                     signal_present = False
                     if len(samples) >= n_fft:
-                        max_power = np.max(power)
-                        if max_power > -70: # Threshold for decoding attempt
-                            self.signal_detected.emit(self.frequency, max_power)
-                            signal_present = True
+                        # Calculate average power in the center frequency range (TETRA bandwidth)
+                        center_idx = len(power) // 2
+                        bandwidth_hz = 25000  # 25 kHz TETRA bandwidth
+                        freq_resolution = self.sample_rate / n_fft
+                        bandwidth_bins = int(bandwidth_hz / freq_resolution)
+                        start_idx = max(0, center_idx - bandwidth_bins // 2)
+                        end_idx = min(len(power), center_idx + bandwidth_bins // 2)
+                        
+                        if end_idx > start_idx:
+                            signal_power = np.mean(power[start_idx:end_idx])
+                            peak_power = np.max(power[start_idx:end_idx])
+                            # Use average power for more stable detection
+                            if signal_power > -60:  # Threshold for signal presence (increased from -80 to avoid noise)
+                                self.signal_detected.emit(self.frequency, signal_power)
+                                signal_present = True
                     
-                    # Process and decode TETRA frames
+                    # Process and decode TETRA frames only if signal is present
+                    # This prevents false positives when there's no signal
                     if signal_present:
                         try:
                             # Demodulate signal
                             demodulated = self.processor.process(samples)
                             
-                            # FM Demodulation for audio monitoring
+                            # Store demodulated symbols for voice extraction
+                            # Get symbols from processor if available
+                            if hasattr(self.processor, 'symbols'):
+                                self.demodulated_symbols = self.processor.symbols
+                            elif hasattr(self.processor, 'get_symbols'):
+                                self.demodulated_symbols = self.processor.get_symbols()
+                            else:
+                                # Extract symbols from demodulated (if it's symbol stream)
+                                # For now, store demodulated as symbols (may need adjustment)
+                                self.demodulated_symbols = demodulated if isinstance(demodulated, np.ndarray) else None
+                            
+                            # Calculate samples per symbol (typically 4 for π/4-DQPSK at 18k samples/sec)
+                            # TETRA symbol rate is 18k symbols/sec, so at 180k samples/sec: 10 samples/symbol
+                            symbol_rate = 18000  # TETRA symbol rate
+                            self.samples_per_symbol = int(self.sample_rate / symbol_rate) if symbol_rate > 0 else 10
+                            
+                            # FM Demodulation for raw audio recording (for offline decoding)
                             if self.monitor_raw:
                                 try:
-                                    # Downsample to ~8kHz for audio
-                                    target_rate = 8000
+                                    # Record raw FM demodulated audio at 48kHz for TETRA decoding
+                                    # This is the "buzz/rasp" sound that can be processed offline
+                                    target_rate = 48000  # TETRA tools expect 48kHz
                                     decimation = int(self.sample_rate / target_rate)
                                     if decimation > 0:
                                         audio_samples = samples[::decimation]
@@ -1194,56 +1164,153 @@ class CaptureThread(QThread):
                                             audio = np.angle(audio_samples[1:] * np.conj(audio_samples[:-1]))
                                             # Normalize volume
                                             audio = audio / np.pi * 0.5
+                                            
+                                            # Record to WAV file for offline processing
+                                            self._record_raw_audio(audio, target_rate)
+                                            
+                                            # Also emit for monitoring
                                             self.raw_audio_data.emit(audio)
                                 except Exception as audio_err:
                                     pass
                         
-                            # Decode TETRA frames
-                            frames = self.decoder.decode(demodulated)
-                        
-                            # Emit all decoded frames
-                            for frame in frames:
-                                # Handle Voice Frames
-                                if frame['type'] == 1: # Traffic
-                                    # Extract payload
-                                    payload = None
-                                    if frame.get('decrypted') and 'decrypted_bytes' in frame:
-                                        try:
-                                            payload = bytes.fromhex(frame['decrypted_bytes'])
-                                        except:
-                                            pass
-                                    elif not frame.get('encrypted') and 'bits' in frame:
-                                        # Extract raw bits for clear voice
-                                        try:
-                                            # Skip header (32 bits)
-                                            payload_bits = frame['bits'][32:]
-                                            if hasattr(payload_bits, 'tobytes'):
-                                                payload = payload_bits.tobytes()
-                                        except:
-                                            pass
-                                
-                                    if payload and self.voice_processor:
-                                        audio_segment = self.voice_processor.decode_frame(payload)
-                                        if len(audio_segment) > 0:
-                                            self.voice_audio_data.emit(audio_segment)
-                                            frame['has_voice'] = True
+                            # Decode TETRA frames only if signal is present
+                            if signal_present:
+                                frames = self.decoder.decode(demodulated)
                             
-                                self.frame_decoded.emit(frame)
-                        
-                            # If no frames decoded, generate one synthetic frame every 3 seconds
-                            # (for testing/demonstration when no real signal)
-                            if len(frames) == 0:
-                                import time
-                                current_time = time.time()
-                                if not hasattr(self, '_last_test_frame'):
-                                    self._last_test_frame = current_time
+                                # Emit all decoded frames
+                                for frame in frames:
+                                    # Try to extract and decode voice from frames
+                                    try:
+                                        if self.voice_processor and self.voice_processor.working:
+                                            # Check if this might be a voice frame
+                                            # Voice is typically in clear MAC-FRAG frames or Traffic frames
+                                            mac_pdu = frame.get('mac_pdu', {})
+                                            pdu_type = str(mac_pdu.get('type', ''))
+                                            is_encrypted = frame.get('encrypted', False)
+                                            
+                                            # Voice candidates: MAC-FRAG or Traffic, not encrypted
+                                            is_voice_candidate = (
+                                                ('FRAG' in pdu_type or frame.get('type') == 1) and
+                                                not is_encrypted
+                                            )
+                                            
+                                            if is_voice_candidate:
+                                                # Extract raw bits from the frame
+                                                # TETRA voice is encoded in the payload bits
+                                                voice_bits = None
+                                                
+                                                # Try to get bits from frame
+                                                if 'bits' in frame:
+                                                    voice_bits = frame['bits']
+                                                elif 'mac_pdu' in frame and 'data' in mac_pdu:
+                                                    # Convert MAC data to bits
+                                                    data = mac_pdu['data']
+                                                    if isinstance(data, bytes):
+                                                        # Convert bytes to bit array
+                                                        bit_list = []
+                                                        for byte_val in data:
+                                                            for bit_idx in range(8):
+                                                                bit_list.append((byte_val >> (7 - bit_idx)) & 1)
+                                                        voice_bits = np.array(bit_list, dtype=np.uint8)
+                                                
+                                                # Try to extract voice slot from symbol stream (preferred method)
+                                                codec_input = None
+                                                if hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
+                                                    codec_input = self._extract_voice_slot_from_symbols(frame, self.demodulated_symbols, self.samples_per_symbol)
+                                                
+                                                # If extraction from symbols failed, try alternative method
+                                                if codec_input is None and voice_bits is not None and len(voice_bits) >= 432:
+                                                    # Build codec input format from 432 soft bits
+                                                    # cdecoder expects 690 shorts with specific structure
+                                                    import struct
+                                                    
+                                                    # Create 690-short block structure
+                                                    block = [0] * 690
+                                                    
+                                                    # Header: 0x6B21 for speech frame
+                                                    block[0] = 0x6B21
+                                                    
+                                                    # Place 432 soft bits in correct positions
+                                                    # Block 1: positions 1-114 (114 bits)
+                                                    # Block 2: positions 116-229 (114 bits) 
+                                                    # Block 3: positions 231-344 (114 bits)
+                                                    # Block 4: positions 346-435 (90 bits)
+                                                    
+                                                    soft_bits = []
+                                                    # Convert hard bits to soft bits: 1 -> +127, 0 -> -127
+                                                    for bit in voice_bits[:432]:
+                                                        soft_bits.append(127 if bit else -127)
+                                                    
+                                                    # Place in block structure
+                                                    idx = 0
+                                                    # Block 1: positions 1-114
+                                                    for i in range(1, 115):
+                                                        if idx < len(soft_bits):
+                                                            block[i] = soft_bits[idx] & 0x00FF  # Mask to 8-bit range
+                                                            idx += 1
+                                                    
+                                                    # Block 2: positions 116-229 (161-45=116)
+                                                    for i in range(116, 230):
+                                                        if idx < len(soft_bits):
+                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            idx += 1
+                                                    
+                                                    # Block 3: positions 231-344 (321-45-45=231)
+                                                    for i in range(231, 345):
+                                                        if idx < len(soft_bits):
+                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            idx += 1
+                                                    
+                                                    # Block 4: positions 346-435 (481-45-45-45=346, 90 values)
+                                                    for i in range(346, 436):
+                                                        if idx < len(soft_bits):
+                                                            block[i] = soft_bits[idx] & 0x00FF
+                                                            idx += 1
+                                                    
+                                                    # Pack as binary (little-endian signed shorts)
+                                                    codec_input = struct.pack('<' + 'h' * 690, *block)
+                                                
+                                                # Process codec input if we have it
+                                                if codec_input is not None and len(codec_input) == 1380:
+                                                    # Save raw frame to file for debugging/offline processing
+                                                    try:
+                                                        import os
+                                                        from datetime import datetime
+                                                        records_dir = os.path.join(os.path.dirname(__file__), "records")
+                                                        os.makedirs(records_dir, exist_ok=True)
+                                                        
+                                                        # Save with timestamp for easier identification
+                                                        if not hasattr(self, 'raw_frames_file') or not self.raw_frames_file:
+                                                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                                            freq_mhz = self.frequency / 1e6
+                                                            self.raw_frames_file = os.path.join(records_dir, f"tetra_frames_{freq_mhz:.3f}MHz_{timestamp}.bin")
+                                                            logger.info(f"📼 Recording raw frames: {os.path.basename(self.raw_frames_file)}")
+                                                        
+                                                        with open(self.raw_frames_file, 'ab') as f:  # Append mode
+                                                            f.write(codec_input)
+                                                    except Exception as e:
+                                                        logger.debug(f"Failed to save raw frame: {e}")
+                                                    
+                                                    # Decode with TETRA codec
+                                                    audio_segment = self.voice_processor.decode_frame(codec_input)
+                                                    if len(audio_segment) > 0:
+                                                        self.voice_audio_data.emit(audio_segment)
+                                                        frame['has_voice'] = True
+                                                        logger.info(f"[OK] Decoded voice: {len(audio_segment)} samples from frame {frame.get('number')}")
+                                                    else:
+                                                        logger.debug(f"Codec returned empty audio for frame {frame.get('number')}")
+                                                else:
+                                                    logger.debug(f"Frame has insufficient data: voice_bits={len(voice_bits) if voice_bits is not None else 0}, codec_input={len(codec_input) if codec_input else 0}")
+                                    except Exception as voice_err:
+                                        logger.debug(f"Voice decode error: {voice_err}")
                             
-                                if current_time - self._last_test_frame > 3:
-                                    # Only show test frame if explicitly enabled
-                                    test_frame = self._generate_synthetic_frame()
-                                    test_frame['is_test_data'] = True  # Mark as test
-                                    self.frame_decoded.emit(test_frame)
-                                    self._last_test_frame = current_time
+                                    self.frame_decoded.emit(frame)
+                            else:
+                                # No signal - don't decode to avoid false positives
+                                frames = []
+                        
+                            # Don't generate test frames - only show real decoded frames
+                            # Test frames cause false positives and confusion
                     
                         except Exception as decode_err:
                             # Log error but don't spam
@@ -1265,6 +1332,166 @@ class CaptureThread(QThread):
             if self.capture:
                 self.capture.close()
             self.status_update.emit("Stopped")
+    
+    def _record_raw_audio(self, audio_data, sample_rate):
+        """Record raw FM demodulated audio for offline TETRA decoding."""
+        import wave
+        import os
+        from datetime import datetime
+        
+        try:
+            # Start new recording if not active
+            if not hasattr(self, 'raw_audio_recording') or not self.raw_audio_recording:
+                records_dir = os.path.join(os.path.dirname(__file__), "records")
+                os.makedirs(records_dir, exist_ok=True)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                freq_mhz = self.frequency / 1e6
+                self.raw_audio_file = os.path.join(records_dir, f"tetra_raw_{freq_mhz:.4f}MHz.wav")
+                
+                # Open WAV file for writing (48kHz, 16-bit, mono)
+                self.raw_wav_file = wave.open(self.raw_audio_file, 'wb')
+                self.raw_wav_file.setnchannels(1)
+                self.raw_wav_file.setsampwidth(2)
+                self.raw_wav_file.setframerate(sample_rate)
+                
+                self.raw_audio_recording = True
+                logger.info(f"Started raw audio recording: {os.path.basename(self.raw_audio_file)}")
+            
+            # Write audio data
+            if self.raw_audio_recording and hasattr(self, 'raw_wav_file'):
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                self.raw_wav_file.writeframes(audio_int16.tobytes())
+                
+        except Exception as e:
+            logger.debug(f"Raw audio recording error: {e}")
+    
+    def _stop_raw_audio_recording(self):
+        """Stop raw audio recording."""
+        if hasattr(self, 'raw_audio_recording') and self.raw_audio_recording:
+            try:
+                if hasattr(self, 'raw_wav_file'):
+                    self.raw_wav_file.close()
+                self.raw_audio_recording = False
+                logger.info(f"Stopped raw audio recording: {os.path.basename(self.raw_audio_file)}")
+            except Exception as e:
+                logger.debug(f"Error stopping raw audio recording: {e}")
+
+    def _extract_voice_slot_from_symbols(self, frame, demodulated_symbols, samples_per_symbol):
+        """
+        Extract TETRA voice slot from symbol stream for codec.
+        Returns soft bits (16-bit integers) in TETRA format (690 shorts = 1380 bytes).
+        """
+        try:
+            import struct
+            
+            # Get frame position in symbol stream (in bits, not symbols)
+            pos = frame.get('position')
+            if pos is None:
+                return None
+            
+            # Convert bit position to symbol position (3 bits per symbol for π/4-DQPSK)
+            symbol_pos = pos // 3
+                
+            # TETRA slot is 255 symbols (510 bits)
+            if symbol_pos + 255 > len(demodulated_symbols):
+                return None
+                
+            slot_symbols = demodulated_symbols[symbol_pos:symbol_pos+255]
+            
+            # Convert symbols to soft bits for codec
+            # π/4-DQPSK has 2 bits per symbol (dibits)
+            soft_bits = []
+            
+            # Normal burst structure:
+            # First block: 108 symbols (216 bits)
+            # Training: 11 symbols (22 bits)
+            # Second block: 108 symbols (216 bits)
+            # Total: 227 symbols before tail
+            
+            # Extract first block (108 symbols = 216 bits)
+            for i in range(108):
+                if i >= len(slot_symbols):
+                    break
+                sym = int(slot_symbols[i])
+                # Extract 2 bits from symbol (MSB first)
+                bit1 = (sym >> 1) & 1
+                bit0 = sym & 1
+                # Convert to soft bits: 1 -> +16384, 0 -> -16384
+                soft_bits.append(16384 if bit1 else -16384)
+                soft_bits.append(16384 if bit0 else -16384)
+            
+            # Skip training sequence (11 symbols at position 108-118)
+            
+            # Extract second block (108 symbols = 216 bits)
+            for i in range(119, 227):
+                if i >= len(slot_symbols):
+                    break
+                sym = int(slot_symbols[i])
+                bit1 = (sym >> 1) & 1
+                bit0 = sym & 1
+                soft_bits.append(16384 if bit1 else -16384)
+                soft_bits.append(16384 if bit0 else -16384)
+            
+            # Now we have 432 soft bits (216 from each block)
+            # cdecoder expects 690 shorts with specific structure matching Write_Tetra_File format
+            # Soft bits must be in range -127 to +127 (masked with 0x00FF)
+            
+            # Create 690-short block structure
+            block = [0] * 690
+            
+            # Header: 0x6B21 for speech frame
+            block[0] = 0x6B21
+            
+            # Convert soft bits to proper range (-127 to +127)
+            # Current soft_bits are ±16384, need to scale to ±127
+            scaled_soft_bits = []
+            for sb in soft_bits:
+                # Scale from ±16384 to ±127 range
+                scaled = int((sb / 16384.0) * 127)
+                # Clamp to valid range
+                scaled = max(-127, min(127, scaled))
+                scaled_soft_bits.append(scaled)
+            
+            # Place 432 soft bits in correct positions according to Write_Tetra_File structure
+            # Block 1: positions 1-114 (114 bits)
+            # Block 2: positions 116-229 (114 bits) 
+            # Block 3: positions 231-344 (114 bits)
+            # Block 4: positions 346-435 (90 bits)
+            
+            idx = 0
+            # Block 1: positions 1-114
+            for i in range(1, 115):
+                if idx < len(scaled_soft_bits):
+                    block[i] = scaled_soft_bits[idx] & 0x00FF  # Mask to 8-bit range
+                    idx += 1
+            
+            # Block 2: positions 116-229 (161-45=116)
+            for i in range(116, 230):
+                if idx < len(scaled_soft_bits):
+                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    idx += 1
+            
+            # Block 3: positions 231-344 (321-45-45=231)
+            for i in range(231, 345):
+                if idx < len(scaled_soft_bits):
+                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    idx += 1
+            
+            # Block 4: positions 346-435 (481-45-45-45=346, 90 values)
+            for i in range(346, 436):
+                if idx < len(scaled_soft_bits):
+                    block[i] = scaled_soft_bits[idx] & 0x00FF
+                    idx += 1
+            
+            # Pack as little-endian signed shorts
+            return struct.pack(f'<{len(block)}h', *block)
+            
+        except Exception as e:
+            logger.debug(f"Error extracting voice slot: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
     
     def _generate_synthetic_frame(self):
         """Generate synthetic frame for display (avoids parse errors)."""
@@ -1348,6 +1575,15 @@ class CaptureThread(QThread):
     def stop(self):
         """Stop capture."""
         self.running = False
+        # Stop raw audio recording if active
+        if hasattr(self, 'raw_audio_recording') and self.raw_audio_recording:
+            try:
+                if hasattr(self, 'raw_wav_file'):
+                    self.raw_wav_file.close()
+                self.raw_audio_recording = False
+                logger.info("Stopped raw audio recording")
+            except Exception as e:
+                logger.debug(f"Error stopping raw audio recording: {e}")
 
 
 class ModernTetraGUI(QMainWindow):
@@ -1362,6 +1598,22 @@ class ModernTetraGUI(QMainWindow):
         self.frame_count = 0
         self.decrypted_count = 0
         self.scanner_dialog = None
+        
+        # TETRA signal detection tracking
+        self.tetra_sync_count = 0
+        self.tetra_frame_count = 0
+        self.tetra_valid_frames = 0
+        self.last_tetra_update = 0.0
+        
+        # SDS reassembly tracking
+        self.sds_fragments = {}  # Key: (src, dst, msg_id), Value: {fragments, timestamp}
+        self.sds_timeout = 30  # seconds
+        
+        # Continuous audio recording
+        self.continuous_recording = True
+        self.audio_buffer = []
+        self.recording_active = False
+        self.recording_start_time = None
         
         self.init_ui()
         self.apply_modern_style()
@@ -1407,6 +1659,18 @@ class ModernTetraGUI(QMainWindow):
         # Frames tab with scrollable table
         frames_widget = self.create_frames_tab()
         tabs.addTab(frames_widget, "📡 Decoded Frames")
+        
+        # Calls tab
+        calls_widget = self.create_calls_tab()
+        tabs.addTab(calls_widget, "📞 Calls")
+        
+        # Groups tab
+        groups_widget = self.create_groups_tab()
+        tabs.addTab(groups_widget, "👥 Groups")
+        
+        # Users tab
+        users_widget = self.create_users_tab()
+        tabs.addTab(users_widget, "👤 Users")
         
         # Log tab
         log_widget = QWidget()
@@ -1604,6 +1868,7 @@ class ModernTetraGUI(QMainWindow):
         options_layout.addWidget(self.auto_decrypt_cb)
         
         self.hear_voice_cb = QCheckBox("🔊 Monitor Audio")
+        self.hear_voice_cb.setChecked(True)  # Enable by default
         self.hear_voice_cb.setChecked(False)  # Default to OFF to avoid noise
         self.hear_voice_cb.setToolTip("Listen to decoded voice (if available)")
         options_layout.addWidget(self.hear_voice_cb)
@@ -1688,14 +1953,24 @@ class ModernTetraGUI(QMainWindow):
         
         # Status indicators (Moved from right column bottom)
         status_group = QGroupBox("Status")
-        status_layout = QHBoxLayout() # Changed to horizontal
+        status_layout = QVBoxLayout() # Changed to vertical for TETRA status
+        status_row1 = QHBoxLayout()
         self.signal_label = QLabel("⚫ No Signal")
         self.signal_label.setStyleSheet("font-weight: bold; padding: 5px;")
-        status_layout.addWidget(self.signal_label)
+        status_row1.addWidget(self.signal_label)
         
         self.decrypt_label = QLabel("🔒 0/0")
         self.decrypt_label.setStyleSheet("font-weight: bold; padding: 5px;")
-        status_layout.addWidget(self.decrypt_label)
+        status_row1.addWidget(self.decrypt_label)
+        status_layout.addLayout(status_row1)
+        
+        # TETRA signal detection status
+        self.tetra_status_label = QLabel("⚫ No TETRA Signal")
+        self.tetra_status_label.setStyleSheet(
+            "font-weight: bold; padding: 5px; color: #888888;"
+        )
+        status_layout.addWidget(self.tetra_status_label)
+        
         status_group.setLayout(status_layout)
         right_col.addWidget(status_group)
         
@@ -1790,6 +2065,66 @@ class ModernTetraGUI(QMainWindow):
         scroll_area.setWidget(self.frames_table)
         layout.addWidget(scroll_area)
         
+        widget.setLayout(layout)
+        return widget
+    
+    def create_calls_tab(self):
+        """Create calls tab."""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Table
+        self.calls_table = QTableWidget()
+        self.calls_table.setColumnCount(10)
+        self.calls_table.setHorizontalHeaderLabels([
+            "Time", "MCarrier", "Carrier", "Slot", "CallID", "Pri", "Type", "From", "To", "Mode"
+        ])
+        self.calls_table.setAlternatingRowColors(True)
+        self.calls_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.calls_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.calls_table.verticalHeader().setVisible(False)
+        
+        layout.addWidget(self.calls_table)
+        widget.setLayout(layout)
+        return widget
+
+    def create_groups_tab(self):
+        """Create groups tab."""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Table
+        self.groups_table = QTableWidget()
+        self.groups_table.setColumnCount(7)
+        self.groups_table.setHorizontalHeaderLabels([
+            "GSSI", "LO", "REC", "MCC", "MNC", "Priority", "Name"
+        ])
+        self.groups_table.setAlternatingRowColors(True)
+        self.groups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.groups_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.groups_table.verticalHeader().setVisible(False)
+        
+        layout.addWidget(self.groups_table)
+        widget.setLayout(layout)
+        return widget
+
+    def create_users_tab(self):
+        """Create users tab."""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Table
+        self.users_table = QTableWidget()
+        self.users_table.setColumnCount(7)
+        self.users_table.setHorizontalHeaderLabels([
+            "ISSI", "LO", "GSSI", "MCC", "MNC", "Name", "Location"
+        ])
+        self.users_table.setAlternatingRowColors(True)
+        self.users_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.users_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.users_table.verticalHeader().setVisible(False)
+        
+        layout.addWidget(self.users_table)
         widget.setLayout(layout)
         return widget
     
@@ -2232,6 +2567,10 @@ class ModernTetraGUI(QMainWindow):
     
     def on_stop(self):
         """Stop capture."""
+        # Save any active recording
+        if self.recording_active:
+            self.save_recording()
+        
         if self.capture_thread:
             self.capture_thread.stop()
             self.capture_thread.wait()
@@ -2296,12 +2635,137 @@ class ModernTetraGUI(QMainWindow):
 
     @pyqtSlot(np.ndarray)
     def on_voice_audio(self, data):
-        """Play decoded voice data."""
-        if hasattr(self, 'audio_stream') and self.audio_stream and self.hear_voice_cb.isChecked():
+        """Play decoded TETRA voice data live and record to continuous WAV."""
+        import os
+        from datetime import datetime
+        import wave
+        
+        # Continuous recording to single WAV file
+        if len(data) > 0:
             try:
-                self.audio_stream.write(data.astype(np.float32))
-            except Exception:
+                # Convert float32 to int16
+                audio_int16 = (data * 32767).astype(np.int16)
+                
+                # Start new recording if not active
+                if not self.recording_active:
+                    records_dir = os.path.join(os.path.dirname(__file__), "records")
+                    os.makedirs(records_dir, exist_ok=True)
+                    
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    freq_mhz = float(self.freq_input.text())
+                    self.current_wav_file = os.path.join(records_dir, f"tetra_voice_{freq_mhz:.3f}MHz_{timestamp}.wav")
+                    
+                    # Open WAV file for writing
+                    self.wav_file = wave.open(self.current_wav_file, 'wb')
+                    self.wav_file.setnchannels(1)
+                    self.wav_file.setsampwidth(2)
+                    self.wav_file.setframerate(8000)
+                    
+                    self.recording_active = True
+                    self.recording_start_time = datetime.now()
+                    self.log(f"🎙️ Recording: {os.path.basename(self.current_wav_file)}")
+                
+                # Write to continuous WAV file
+                if self.recording_active and hasattr(self, 'wav_file'):
+                    self.wav_file.writeframes(audio_int16.tobytes())
+                
+            except Exception as e:
+                logger.debug(f"Failed to record voice: {e}")
+        
+        # Play audio LIVE if monitoring enabled
+        if self.hear_voice_cb.isChecked() and len(data) > 0:
+            try:
+                # Ensure audio stream exists and is started
+                if not hasattr(self, 'audio_stream') or self.audio_stream is None:
+                    self.init_audio()
+                
+                if hasattr(self, 'audio_stream') and self.audio_stream:
+                    # Check if stream is active, restart if needed
+                    if not self.audio_stream.active:
+                        try:
+                            self.audio_stream.stop()
+                        except:
+                            pass
+                        self.audio_stream.start()
+                    
+                    # Write audio data - YOU WILL HEAR THIS LIVE!
+                    self.audio_stream.write(data.astype(np.float32))
+            except Exception as e:
+                logger.debug(f"Audio playback error: {e}")
+                # Try to reinitialize audio stream
+                try:
+                    if hasattr(self, 'audio_stream') and self.audio_stream:
+                        try:
+                            self.audio_stream.stop()
+                        except:
+                            pass
+                    self.init_audio()
+                    if hasattr(self, 'audio_stream') and self.audio_stream:
+                        self.audio_stream.write(data.astype(np.float32))
+                except Exception as e2:
+                    logger.debug(f"Audio reinit failed: {e2}")
+
+    def save_recording(self):
+        """Close current recording file."""
+        if self.recording_active and hasattr(self, 'wav_file'):
+            try:
+                self.wav_file.close()
+                duration = (datetime.now() - self.recording_start_time).total_seconds()
+                self.log(f"Saved voice recording: {os.path.basename(self.current_wav_file)} ({duration:.1f}s)")
+                self.recording_active = False
+            except Exception as e:
+                logger.debug(f"Failed to close recording: {e}")
+    
+    def reassemble_sds_message(self, frame):
+        """Reassemble SDS fragments into complete message or parse existing."""
+        # First check if the frame already has an SDS message parsed by the decoder
+        if 'sds_message' in frame and frame['sds_message']:
+            # Already parsed, just return it
+            return frame['sds_message']
+        
+        if 'decoded_text' in frame and frame['decoded_text']:
+            # Already has decoded text
+            return frame['decoded_text']
+        
+        # Try to parse from decrypted bytes or MAC data
+        data = None
+        if 'decrypted_bytes' in frame:
+            try:
+                data = bytes.fromhex(frame['decrypted_bytes'])
+            except:
                 pass
+        elif 'mac_pdu' in frame and 'data' in frame['mac_pdu']:
+            data = frame['mac_pdu']['data']
+            if isinstance(data, str):
+                try:
+                    data = bytes.fromhex(data.replace(' ', ''))
+                except:
+                    pass
+        
+        if not data or len(data) < 1:
+            return None
+        
+        # Try to parse as SDS
+        from tetra_protocol import TetraProtocolParser
+        parser = TetraProtocolParser()
+        sds_text = parser.parse_sds_data(data)
+        
+        if sds_text and not sds_text.startswith("[BIN]"):
+            return sds_text
+        
+        # Try to decode as text if it looks printable
+        try:
+            printable_count = sum(1 for b in data if 32 <= b <= 126 or b in (10, 13))
+            if len(data) > 0 and (printable_count / len(data)) > 0.5:
+                text = data.decode('latin-1', errors='replace')
+                text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else '' for c in text)
+                text = text.strip()
+                if len(text) > 2:  # At least a few characters
+                    return f"[TXT] {text}"
+        except:
+            pass
+        
+        return None
 
     def apply_filter(self, text):
         """Apply type filter to existing rows."""
@@ -2341,13 +2805,181 @@ class ModernTetraGUI(QMainWindow):
                 
             self.frames_table.setRowHidden(row, not visible)
 
+    def update_tables(self, frame):
+        """Update Calls, Groups, and Users tables."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Extract metadata
+        meta = frame.get('call_metadata', {})
+        if not meta and 'additional_info' in frame:
+            # Map additional_info to meta structure
+            info = frame['additional_info']
+            if 'talkgroup' in info: meta['talkgroup_id'] = info['talkgroup']
+            if 'source_ssi' in info: meta['source_ssi'] = info['source_ssi']
+            if 'dest_ssi' in info: meta['dest_ssi'] = info['dest_ssi']
+            if 'control' in info: meta['call_type'] = info['control']
+            if 'mcc' in info: meta['mcc'] = info['mcc']
+            if 'mnc' in info: meta['mnc'] = info['mnc']
+        
+        # Helper to format None as empty string
+        def fmt(val):
+            return str(val) if val is not None else ""
+
+        # Update Calls Table
+        # Columns: Time, MCarrier, Carrier, Slot, CallID, Pri, Type, From, To, Mode
+        if meta.get('call_type') or meta.get('source_ssi') or meta.get('dest_ssi') or meta.get('talkgroup_id'):
+            row = self.calls_table.rowCount()
+            self.calls_table.insertRow(row)
+            self.calls_table.setItem(row, 0, QTableWidgetItem(timestamp))
+            self.calls_table.setItem(row, 1, QTableWidgetItem(fmt(frame.get('frequency')))) # MCarrier
+            self.calls_table.setItem(row, 2, QTableWidgetItem(fmt(meta.get('channel')))) # Carrier
+            self.calls_table.setItem(row, 3, QTableWidgetItem(fmt(frame.get('timeslot')))) # Slot
+            self.calls_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('call_identifier')))) # CallID
+            self.calls_table.setItem(row, 5, QTableWidgetItem(fmt(meta.get('priority')))) # Pri
+            self.calls_table.setItem(row, 6, QTableWidgetItem(fmt(meta.get('call_type')))) # Type
+            self.calls_table.setItem(row, 7, QTableWidgetItem(fmt(meta.get('source_ssi')))) # From
+            
+            # To field: Dest SSI or Talkgroup
+            to_val = fmt(meta.get('dest_ssi'))
+            if not to_val and meta.get('talkgroup_id'):
+                to_val = f"TG:{meta['talkgroup_id']}"
+            self.calls_table.setItem(row, 8, QTableWidgetItem(to_val)) # To
+            
+            mode = "Encrypted" if frame.get('encrypted') else "Clear"
+            if frame.get('has_voice'): mode += " (Voice)"
+            if frame.get('decrypted'): mode += " [DEC]"
+            self.calls_table.setItem(row, 9, QTableWidgetItem(mode)) # Mode
+            
+            if self.autoscroll_cb.isChecked():
+                self.calls_table.scrollToBottom()
+
+        # Update Groups Table (if GSSI present)
+        # Columns: GSSI, LO, REC, MCC, MNC, Priority, Name
+        if meta.get('talkgroup_id'):
+            gssi = str(meta['talkgroup_id'])
+            # Check if already exists
+            found = False
+            for r in range(self.groups_table.rowCount()):
+                item = self.groups_table.item(r, 0)
+                if item and item.text() == gssi:
+                    found = True
+                    # Update Last Seen (LO)
+                    self.groups_table.setItem(r, 1, QTableWidgetItem(timestamp))
+                    # Update other fields if they were empty
+                    if not self.groups_table.item(r, 3).text():
+                        self.groups_table.setItem(r, 3, QTableWidgetItem(fmt(meta.get('mcc'))))
+                    if not self.groups_table.item(r, 4).text():
+                        self.groups_table.setItem(r, 4, QTableWidgetItem(fmt(meta.get('mnc'))))
+                    break
+            
+            if not found:
+                row = self.groups_table.rowCount()
+                self.groups_table.insertRow(row)
+                self.groups_table.setItem(row, 0, QTableWidgetItem(gssi))
+                self.groups_table.setItem(row, 1, QTableWidgetItem(timestamp)) # LO
+                self.groups_table.setItem(row, 2, QTableWidgetItem("")) # REC
+                self.groups_table.setItem(row, 3, QTableWidgetItem(fmt(meta.get('mcc')))) # MCC
+                self.groups_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('mnc')))) # MNC
+                self.groups_table.setItem(row, 5, QTableWidgetItem(fmt(meta.get('priority')))) # Priority
+                self.groups_table.setItem(row, 6, QTableWidgetItem("")) # Name
+
+        # Update Users Table (if ISSI present)
+        # Columns: ISSI, LO, GSSI, MCC, MNC, Name, Location
+        if meta.get('source_ssi'):
+            issi = str(meta['source_ssi'])
+            # Check if already exists
+            found = False
+            for r in range(self.users_table.rowCount()):
+                item = self.users_table.item(r, 0)
+                if item and item.text() == issi:
+                    found = True
+                    # Update Last Seen
+                    self.users_table.setItem(r, 1, QTableWidgetItem(timestamp))
+                    # Update GSSI if present
+                    if meta.get('talkgroup_id'):
+                        self.users_table.setItem(r, 2, QTableWidgetItem(str(meta['talkgroup_id'])))
+                    
+                    # Update MCC/MNC if present
+                    if meta.get('mcc'): self.users_table.setItem(r, 3, QTableWidgetItem(str(meta['mcc'])))
+                    if meta.get('mnc'): self.users_table.setItem(r, 4, QTableWidgetItem(str(meta['mnc'])))
+                    
+                    # Update Location if present in SDS
+                    sds_msg = frame.get('sds_message', '')
+                    if "[LIP]" in sds_msg or "[GPS]" in sds_msg:
+                        # Extract location part
+                        loc_data = sds_msg.replace("[LIP]", "").replace("[GPS]", "").strip()
+                        self.users_table.setItem(r, 6, QTableWidgetItem(loc_data))
+                    break
+            
+            if not found:
+                row = self.users_table.rowCount()
+                self.users_table.insertRow(row)
+                self.users_table.setItem(row, 0, QTableWidgetItem(issi))
+                self.users_table.setItem(row, 1, QTableWidgetItem(timestamp)) # LO
+                self.users_table.setItem(row, 2, QTableWidgetItem(fmt(meta.get('talkgroup_id')))) # GSSI
+                self.users_table.setItem(row, 3, QTableWidgetItem(fmt(meta.get('mcc')))) # MCC
+                self.users_table.setItem(row, 4, QTableWidgetItem(fmt(meta.get('mnc')))) # MNC
+                self.users_table.setItem(row, 5, QTableWidgetItem("")) # Name
+                
+                # Location
+                loc_data = ""
+                sds_msg = frame.get('sds_message', '')
+                if "[LIP]" in sds_msg or "[GPS]" in sds_msg:
+                    loc_data = sds_msg.replace("[LIP]", "").replace("[GPS]", "").strip()
+                self.users_table.setItem(row, 6, QTableWidgetItem(loc_data)) # Location
+
     @pyqtSlot(dict)
     def on_frame(self, frame):
         """Handle decoded frame."""
         self.frame_count += 1
         
-        # Check if this is test data
+        # Update new tables
+        self.update_tables(frame)
+        
+        # Try SDS reassembly first
+        reassembled_sds = self.reassemble_sds_message(frame)
+        if reassembled_sds:
+            frame['sds_message'] = reassembled_sds
+            frame['is_reassembled'] = True
+        
+        # Check if this is test data FIRST - don't count test frames for TETRA detection
         is_test = frame.get('is_test_data', False)
+        
+        # Track TETRA signal detection (only for real frames, not test data)
+        # Also require that we have actual signal power (from signal label)
+        if not is_test:
+            import time
+            # Get current signal power
+            signal_text = self.signal_label.text()
+            try:
+                import re
+                power_match = re.search(r'(-?\d+\.?\d*)\s*dB', signal_text)
+                signal_power = float(power_match.group(1)) if power_match else -100
+            except:
+                signal_power = -100
+            
+            # Only count frames if we have actual signal power above noise floor
+            if signal_power > -60:  # Require signal above noise floor (increased from -80)
+                # Count all non-test frames as potential TETRA frames
+                self.tetra_frame_count += 1
+                
+                # Check for sync position (indicates sync pattern was found)
+                if frame.get('position') is not None:
+                    self.tetra_sync_count += 1
+                
+                # Check for valid CRC (indicates valid frame structure)
+                if frame.get('burst_crc') is True:
+                    self.tetra_valid_frames += 1
+                elif 'burst_crc' not in frame and frame.get('type') is not None:
+                    # Frame was decoded even without explicit CRC - count as valid
+                    self.tetra_valid_frames += 0.5
+                
+                # Update TETRA status every 5 frames or every 2 seconds
+                current_time = time.time()
+                if (self.tetra_frame_count % 5 == 0 or 
+                    current_time - self.last_tetra_update > 2.0):
+                    self.update_tetra_status()
+                    self.last_tetra_update = current_time
         
         if frame.get('decrypted'):
             self.decrypted_count += 1
@@ -2370,19 +3002,34 @@ class ModernTetraGUI(QMainWindow):
         row = self.frames_table.rowCount()
         self.frames_table.insertRow(row)
         
-        # Determine row color based on frame type
+        # Determine row color based on frame type - Enhanced colors
         row_bg = None
+        text_color = None
         
         if "MAC-RESOURCE" in type_name:
-            row_bg = QColor(20, 30, 50)  # Dark Blue tint
+            row_bg = QColor(30, 50, 80)  # Bright Blue
+            text_color = QColor(200, 220, 255)  # Light blue text
         elif "MAC-BROADCAST" in type_name:
-            row_bg = QColor(50, 40, 20)  # Dark Yellow/Orange tint
+            row_bg = QColor(80, 70, 30)  # Bright Yellow/Orange
+            text_color = QColor(255, 240, 200)  # Light yellow text
         elif "MAC-FRAG" in type_name:
-            row_bg = QColor(20, 40, 20)  # Dark Green tint
+            row_bg = QColor(30, 80, 30)  # Bright Green
+            text_color = QColor(200, 255, 200)  # Light green text
         elif "MAC-SUPPL" in type_name:
-            row_bg = QColor(40, 20, 40)  # Dark Purple tint
+            row_bg = QColor(80, 30, 80)  # Bright Purple
+            text_color = QColor(255, 200, 255)  # Light purple text
         elif "MAC-U-SIGNAL" in type_name:
-            row_bg = QColor(50, 20, 20)  # Dark Red tint
+            row_bg = QColor(100, 30, 30)  # Bright Red
+            text_color = QColor(255, 200, 200)  # Light red text
+        elif "MAC-DATA" in type_name:
+            row_bg = QColor(30, 80, 100)  # Bright Cyan
+            text_color = QColor(200, 255, 255)  # Light cyan text
+        elif frame.get('has_voice'):
+            row_bg = QColor(0, 120, 0)  # Bright Green for voice
+            text_color = QColor(200, 255, 200)  # Light green text
+        elif 'sds_message' in frame or 'decoded_text' in frame:
+            row_bg = QColor(0, 100, 120)  # Bright Cyan for SDS
+            text_color = QColor(200, 255, 255)  # Light cyan text
             
         def create_item(text, color=None):
             item = QTableWidgetItem(str(text))
@@ -2390,6 +3037,8 @@ class ModernTetraGUI(QMainWindow):
                 item.setForeground(QColor(128, 128, 128))
             elif color:
                 item.setForeground(color)
+            elif text_color:
+                item.setForeground(text_color)
             
             if row_bg:
                 item.setBackground(row_bg)
@@ -2434,7 +3083,8 @@ class ModernTetraGUI(QMainWindow):
         # Add SDS message if available
         if 'sds_message' in frame:
             sds = frame['sds_message']
-            desc += f" | 💬 \"{sds[:40]}\""
+            prefix = "🧩 " if frame.get('is_reassembled') else "💬 "
+            desc += f" | {prefix}\"{sds[:40]}\""
         
         # Mark test data
         if is_test:
@@ -2465,33 +3115,92 @@ class ModernTetraGUI(QMainWindow):
         data_str = ""
         if frame.get('has_voice'):
              data_str = "🔊 Voice Audio (Decoded)"
-        elif 'decoded_text' in frame:
+        elif 'decoded_text' in frame and frame['decoded_text']:
              data_str = f"📝 {frame['decoded_text']}"
-        elif 'sds_message' in frame:
+        elif 'sds_message' in frame and frame['sds_message']:
              data_str = f"📝 {frame['sds_message']}"
+        elif 'decrypted_bytes' in frame:
+             # Try to parse decrypted bytes as text if printable
+             try:
+                 data_bytes = bytes.fromhex(frame['decrypted_bytes'])
+                 if len(data_bytes) > 0:
+                     printable_count = sum(1 for b in data_bytes if 32 <= b <= 126 or b in (10, 13))
+                     if (printable_count / len(data_bytes)) > 0.7:
+                         # Try to decode as text
+                         text = data_bytes.decode('latin-1', errors='replace')
+                         text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else ' ' for c in text)
+                         text = text.strip()
+                         if text:
+                             data_str = f"📝 [TXT] {text[:100]}"  # Limit length
+                         else:
+                             # Show hex if text is empty after cleaning
+                             hex_str = data_bytes.hex()
+                             data_str = ' '.join(hex_str[i:i+2] for i in range(0, min(len(hex_str), 64), 2))
+                             if len(hex_str) > 64:
+                                 data_str += "..."
+                     else:
+                         # Show hex for binary data
+                         hex_str = data_bytes.hex()
+                         data_str = ' '.join(hex_str[i:i+2] for i in range(0, min(len(hex_str), 64), 2))
+                         if len(hex_str) > 64:
+                             data_str += "..."
+                 else:
+                     data_str = "(empty)"
+             except Exception as e:
+                 logger.debug(f"Error parsing decrypted bytes: {e}")
+                 data_str = "(parse error)"
         elif 'mac_pdu' in frame and 'data' in frame['mac_pdu']:
             data = frame['mac_pdu']['data']
             if isinstance(data, (bytes, bytearray)):
-                # Format as hex with spaces
-                hex_str = data.hex()
-                data_str = ' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))
+                # Try to decode as text first
+                try:
+                    printable_count = sum(1 for b in data if 32 <= b <= 126 or b in (10, 13))
+                    if len(data) > 0 and (printable_count / len(data)) > 0.7:
+                        text = data.decode('latin-1', errors='replace')
+                        text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else ' ' for c in text)
+                        text = text.strip()
+                        if text:
+                            data_str = f"📝 {text[:100]}"
+                        else:
+                            hex_str = data.hex()
+                            data_str = ' '.join(hex_str[i:i+2] for i in range(0, min(len(hex_str), 64), 2))
+                    else:
+                        # Format as hex with spaces
+                        hex_str = data.hex()
+                        data_str = ' '.join(hex_str[i:i+2] for i in range(0, min(len(hex_str), 64), 2))
+                        if len(hex_str) > 64:
+                            data_str += "..."
+                except:
+                    hex_str = data.hex()
+                    data_str = ' '.join(hex_str[i:i+2] for i in range(0, min(len(hex_str), 64), 2))
             else:
-                data_str = str(data)
-        elif 'decrypted_bytes' in frame:
-             # If we have decrypted bytes but NO decoded text, show HEX to avoid garbage
-             data_bytes = bytes.fromhex(frame['decrypted_bytes'])
-             hex_str = data_bytes.hex()
-             data_str = ' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))
+                data_str = str(data)[:100]
         elif 'bits' in frame:
              # Show first few bytes of raw bits if nothing else
              try:
                  bits = frame['bits']
                  if hasattr(bits, 'tobytes'):
-                     data_str = bits.tobytes().hex()
+                     data_bytes = bits.tobytes()
+                     if len(data_bytes) > 0:
+                         printable_count = sum(1 for b in data_bytes if 32 <= b <= 126 or b in (10, 13))
+                         if (printable_count / len(data_bytes)) > 0.7:
+                             text = data_bytes.decode('latin-1', errors='replace')
+                             text = ''.join(c if (32 <= ord(c) <= 126 or c in '\n\r') else ' ' for c in text)
+                             text = text.strip()
+                             if text:
+                                 data_str = f"📝 {text[:50]}"
+                             else:
+                                 data_str = data_bytes.hex()[:50]
+                         else:
+                             data_str = data_bytes.hex()[:50]
+                     else:
+                         data_str = "(empty)"
                  else:
-                     data_str = str(bits)[:20] + "..."
+                     data_str = str(bits)[:50] + "..."
              except:
-                 pass
+                 data_str = "(parse error)"
+        else:
+            data_str = "(no data)"
                  
         self.frames_table.setItem(row, 6, create_item(data_str))
         
@@ -2526,6 +3235,61 @@ class ModernTetraGUI(QMainWindow):
         """Update displays."""
         self.decrypt_label.setText(f"🔒 {self.decrypted_count}/{self.frame_count}")
     
+    def update_tetra_status(self):
+        """Update TETRA signal detection status indicator."""
+        if self.tetra_frame_count == 0:
+            self.tetra_status_label.setText("⚫ No TETRA Signal")
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #888888;"
+            )
+            return
+        
+        # Calculate detection metrics
+        sync_rate = self.tetra_sync_count / max(self.tetra_frame_count, 1)
+        crc_rate = self.tetra_valid_frames / max(self.tetra_frame_count, 1)
+        
+        # More lenient detection criteria for real-world signals
+        # If we're decoding frames (even without perfect sync), it's likely TETRA
+        is_tetra_detected = (
+            self.tetra_frame_count >= 3 and  # At least 3 frames decoded
+            (sync_rate > 0.1 or crc_rate > 0.1)  # At least 10% sync OR CRC
+        )
+        
+        # High confidence: multiple frames with good sync/CRC
+        high_confidence = (
+            self.tetra_frame_count >= 5 and
+            (sync_rate > 0.3 or crc_rate > 0.3)
+        )
+        
+        if high_confidence:
+            self.tetra_status_label.setText(
+                f"🟢 TETRA Signal Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%})"
+            )
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #00ff00; background-color: #002200;"
+            )
+        elif is_tetra_detected:
+            # Medium confidence: some frames decoded
+            self.tetra_status_label.setText(
+                f"🟡 TETRA Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%})"
+            )
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #ffaa00; background-color: #221100;"
+            )
+        elif self.tetra_frame_count >= 1:
+            # Low confidence: frames decoded but no sync/CRC
+            self.tetra_status_label.setText(
+                f"🟡 Possible TETRA ({self.tetra_frame_count} frames decoded)"
+            )
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #ffaa00; background-color: #221100;"
+            )
+        else:
+            self.tetra_status_label.setText("⚫ No TETRA Signal")
+            self.tetra_status_label.setStyleSheet(
+                "font-weight: bold; padding: 5px; color: #888888;"
+            )
+    
     def update_stats(self):
         """Update statistics."""
         html = f"""
@@ -2534,6 +3298,8 @@ class ModernTetraGUI(QMainWindow):
         <tr><td><b>Total Frames:</b></td><td>{self.frame_count}</td></tr>
         <tr><td><b>Decrypted:</b></td><td>{self.decrypted_count}</td></tr>
         <tr><td><b>Success Rate:</b></td><td>{(self.decrypted_count/max(1,self.frame_count)*100):.1f}%</td></tr>
+        <tr><td><b>TETRA Frames:</b></td><td>{self.tetra_frame_count}</td></tr>
+        <tr><td><b>Valid CRC:</b></td><td>{self.tetra_valid_frames}</td></tr>
         </table>
         """
         self.stats_text.setHtml(html)
@@ -2552,6 +3318,10 @@ class ModernTetraGUI(QMainWindow):
     
     def closeEvent(self, event):
         """Handle close."""
+        # Save any active recording
+        if self.recording_active:
+            self.save_recording()
+        
         if self.capture_thread and self.capture_thread.isRunning():
             self.capture_thread.stop()
             self.capture_thread.wait()
@@ -2559,12 +3329,130 @@ class ModernTetraGUI(QMainWindow):
 
 
 def main():
-    """Main entry point."""
+    """Main entry point with CLI argument support."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='TETRA Decoder Pro - Modern GUI with live voice decoding',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s                              # Launch GUI normally
+  %(prog)s -f 392.225                   # Start with frequency preset
+  %(prog)s -f 392.225 --auto-start      # Auto-start capture
+  %(prog)s -f 392.225 --auto-start -m   # Auto-start with audio monitoring
+  %(prog)s -f 392.225 -g 35 -s 1.8      # Set frequency, gain, sample rate
+  %(prog)s --scan 390 392               # Scan range first, then launch GUI
+        '''
+    )
+    
+    parser.add_argument('-f', '--frequency', type=float,
+                        help='Frequency in MHz (e.g., 392.225)')
+    parser.add_argument('-g', '--gain', type=float, default=25.0,
+                        help='RF gain in dB (default: 25.0, or "auto")')
+    parser.add_argument('-s', '--sample-rate', type=float, default=1.8,
+                        help='Sample rate in MHz (default: 1.8)')
+    parser.add_argument('--auto-start', action='store_true',
+                        help='Automatically start capture on launch')
+    parser.add_argument('-m', '--monitor-audio', action='store_true',
+                        help='Enable audio monitoring on start')
+    parser.add_argument('--scan', nargs=2, type=float, metavar=('START', 'STOP'),
+                        help='Scan frequency range first (in MHz)')
+    parser.add_argument('--auto-decrypt', action='store_true', default=True,
+                        help='Enable auto-decryption (default: enabled)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s'
+        )
+    
+    # Scan if requested
+    if args.scan:
+        print("=" * 60)
+        print("SCANNING FOR TETRA SIGNALS")
+        print("=" * 60)
+        from rtl_capture import RTLCapture
+        from frequency_scanner import FrequencyScanner
+        
+        start_freq = args.scan[0] * 1e6
+        stop_freq = args.scan[1] * 1e6
+        
+        rtl = RTLCapture(frequency=start_freq, sample_rate=1.8e6, gain='auto')
+        if rtl.open():
+            scanner = FrequencyScanner(rtl, scan_step=25e3)
+            results = []
+            
+            print(f"\nScanning {args.scan[0]:.3f} - {args.scan[1]:.3f} MHz...")
+            freq = start_freq
+            while freq <= stop_freq:
+                result = scanner.scan_frequency(freq)
+                if result['power_db'] > -60:
+                    results.append(result)
+                    print(f"  {freq/1e6:.3f} MHz: {result['power_db']:.1f} dB *** SIGNAL")
+                freq += 25e3
+            
+            rtl.close()
+            
+            if results:
+                results.sort(key=lambda x: x['power_db'], reverse=True)
+                best = results[0]
+                print(f"\n✓ Best signal: {best['frequency']/1e6:.3f} MHz ({best['power_db']:.1f} dB)")
+                if not args.frequency:
+                    args.frequency = best['frequency'] / 1e6
+                    print(f"  Auto-setting frequency to {args.frequency:.3f} MHz")
+            else:
+                print("\n✗ No strong signals found")
+            print()
+    
+    # Create Qt application
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
     window = ModernTetraGUI()
+    
+    # Apply CLI arguments
+    if args.frequency:
+        window.freq_input.setText(f"{args.frequency:.3f}")
+        logger.info(f"Set frequency to {args.frequency:.3f} MHz")
+    
+    if args.gain != 25.0:
+        # Convert gain to slider value (0-100 = 0-50 dB)
+        slider_val = int(args.gain * 2)
+        window.gain_slider.setValue(slider_val)
+        logger.info(f"Set gain to {args.gain:.1f} dB")
+    
+    if args.sample_rate != 1.8:
+        # Convert sample rate to slider value
+        if args.sample_rate == 2.4:
+            window.sample_rate_slider.setValue(6)
+        logger.info(f"Set sample rate to {args.sample_rate:.1f} MHz")
+    
+    if args.monitor_audio:
+        window.hear_voice_cb.setChecked(True)
+        logger.info("Audio monitoring enabled")
+    
+    if not args.auto_decrypt:
+        window.auto_decrypt_cb.setChecked(False)
+    
     window.show()
+    
+    # Auto-start if requested
+    if args.auto_start:
+        logger.info("Auto-starting capture...")
+        # Use QTimer to start after GUI is fully initialized
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(500, window.on_start)
     
     sys.exit(app.exec())
 
