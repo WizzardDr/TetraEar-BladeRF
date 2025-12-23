@@ -48,7 +48,7 @@ class SignalProcessor:
         resampled = signal.resample(samples, new_num_samples)
         return resampled
     
-    def filter_signal(self, samples, bandwidth=25000):
+    def filter_signal(self, samples, bandwidth=25000, sample_rate=None):
         """
         Apply bandpass filter to isolate TETRA signal channel.
         
@@ -58,6 +58,7 @@ class SignalProcessor:
         Args:
             samples: Input samples
             bandwidth: Filter bandwidth in Hz (default: 25 kHz for TETRA)
+            sample_rate: Sample rate in Hz (optional, defaults to self.sample_rate)
             
         Returns:
             Filtered samples
@@ -65,7 +66,8 @@ class SignalProcessor:
         if len(samples) == 0:
             return samples
         
-        nyquist = self.sample_rate / 2
+        fs = sample_rate if sample_rate is not None else self.sample_rate
+        nyquist = fs / 2
         
         # Design Butterworth lowpass filter for baseband signal
         # Filter should pass TETRA channel bandwidth (25 kHz)
@@ -80,18 +82,20 @@ class SignalProcessor:
             logger.warning(f"Filter design failed, using unfiltered samples: {e}")
             return samples
     
-    def frequency_shift(self, samples, freq_offset):
+    def frequency_shift(self, samples, freq_offset, sample_rate=None):
         """
         Apply frequency correction.
         
         Args:
             samples: Input samples
             freq_offset: Frequency offset in Hz
+            sample_rate: Sample rate in Hz (optional, defaults to self.sample_rate)
             
         Returns:
             Frequency-shifted samples
         """
-        t = np.arange(len(samples)) / self.sample_rate
+        fs = sample_rate if sample_rate is not None else self.sample_rate
+        t = np.arange(len(samples)) / fs
         shift = np.exp(-1j * 2 * np.pi * freq_offset * t)
         return samples * shift
     
@@ -161,12 +165,13 @@ class SignalProcessor:
         
         return np.array(symbols, dtype=np.uint8)
     
-    def extract_symbols(self, samples):
+    def extract_symbols(self, samples, sample_rate=None):
         """
         Extract symbols from samples at symbol rate with simple timing recovery.
         
         Args:
             samples: Input samples
+            sample_rate: Sample rate in Hz (optional, defaults to self.sample_rate)
             
         Returns:
             Symbol stream (complex samples at symbol rate)
@@ -174,8 +179,11 @@ class SignalProcessor:
         if len(samples) == 0:
             return np.array([], dtype=complex)
         
+        fs = sample_rate if sample_rate is not None else self.sample_rate
+        samples_per_symbol = int(fs / self.symbol_rate)
+        
         # Downsample to symbol rate using decimation
-        if self.samples_per_symbol > 1:
+        if samples_per_symbol > 1:
             # Simple timing recovery: Find the phase with maximum average power
             # This helps align with the symbol centers (RRC pulse peaks)
             best_phase = 0
@@ -183,15 +191,15 @@ class SignalProcessor:
             
             # Check a few phases to find the best alignment
             # We don't need to check every sample, just enough to find the peak
-            step = max(1, self.samples_per_symbol // 8)
+            step = max(1, samples_per_symbol // 8)
             
-            for phase in range(0, self.samples_per_symbol, step):
+            for phase in range(0, samples_per_symbol, step):
                 # Extract symbols at this phase
-                num_symbols = (len(samples) - phase) // self.samples_per_symbol
+                num_symbols = (len(samples) - phase) // samples_per_symbol
                 if num_symbols <= 0:
                     continue
                     
-                indices = phase + np.arange(num_symbols) * self.samples_per_symbol
+                indices = phase + np.arange(num_symbols) * samples_per_symbol
                 phase_samples = samples[indices]
                 
                 # Calculate average power for this phase
@@ -202,8 +210,8 @@ class SignalProcessor:
                     best_phase = phase
             
             # Extract using the best phase
-            num_symbols = (len(samples) - best_phase) // self.samples_per_symbol
-            indices = best_phase + np.arange(num_symbols) * self.samples_per_symbol
+            num_symbols = (len(samples) - best_phase) // samples_per_symbol
+            indices = best_phase + np.arange(num_symbols) * samples_per_symbol
             symbols = samples[indices]
         else:
             symbols = samples
@@ -215,10 +223,11 @@ class SignalProcessor:
         Complete signal processing pipeline for TETRA demodulation.
         
         Processing steps:
-        1. Frequency offset correction (if needed)
-        2. Bandpass filtering to isolate TETRA channel (25 kHz bandwidth)
-        3. Symbol extraction at 18 kHz symbol rate
-        4. π/4-DQPSK differential demodulation
+        1. Decimation (if sample rate is high)
+        2. Frequency offset correction (if needed)
+        3. Bandpass filtering to isolate TETRA channel (25 kHz bandwidth)
+        4. Symbol extraction at 18 kHz symbol rate
+        5. π/4-DQPSK differential demodulation
         
         Args:
             samples: Raw IQ samples
@@ -230,16 +239,32 @@ class SignalProcessor:
         if len(samples) == 0:
             self.symbols = np.array([], dtype=complex)
             return np.array([], dtype=np.uint8)
+            
+        # Handle high sample rates by decimating first
+        # Target ~240 kHz which is sufficient for TETRA (25kHz BW) and allows for some frequency offset
+        target_rate = 240000
+        current_rate = self.sample_rate
+        
+        if current_rate > target_rate * 2:
+            decimation_factor = int(current_rate / target_rate)
+            if decimation_factor > 1:
+                # Use scipy.signal.decimate which includes a low-pass filter to prevent aliasing
+                # This is much more efficient than processing at full rate
+                try:
+                    samples = signal.decimate(samples, decimation_factor)
+                    current_rate = current_rate / decimation_factor
+                except Exception as e:
+                    logger.warning(f"Decimation failed: {e}")
         
         # Apply frequency correction if needed
         if freq_offset != 0:
-            samples = self.frequency_shift(samples, freq_offset)
+            samples = self.frequency_shift(samples, freq_offset, sample_rate=current_rate)
         
         # Filter signal to isolate TETRA channel (25 kHz bandwidth)
-        filtered = self.filter_signal(samples, bandwidth=25000)
+        filtered = self.filter_signal(samples, bandwidth=25000, sample_rate=current_rate)
         
         # Extract symbols at symbol rate (18 kHz)
-        symbols = self.extract_symbols(filtered)
+        symbols = self.extract_symbols(filtered, sample_rate=current_rate)
         self.symbols = symbols  # Store for voice extraction
         
         # Demodulate using π/4-DQPSK

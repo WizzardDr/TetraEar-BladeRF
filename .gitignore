@@ -21,7 +21,8 @@ wheels/
 *.egg
 logs/
 records/
-tetra_codec/
+tetra_codec/*
+resources/*
 
 # Virtual environments
 venv/
@@ -51,6 +52,15 @@ ENV/
 # Codec build artifacts
 .codecbuild/
 
+# Development tools
+dev_tools/
+
+# PyInstaller
+*.spec
+
 # OS
 .DS_Store
 Thumbs.db
+/settings.json
+/run_admin.ps1
+/TETRA_Decoder_Modern.spec

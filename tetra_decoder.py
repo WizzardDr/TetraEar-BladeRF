@@ -96,6 +96,37 @@ class TetraDecoder:
             ]
         }
         logger.debug(f"Auto-decrypt enabled with {sum(len(v) for v in self.common_keys.values())} common keys (OpenEar style)")
+        self.user_keys = []  # Additional keys loaded from file
+    
+    def set_keys(self, keys):
+        """
+        Set user-provided encryption keys for bruteforce attempts.
+        
+        Args:
+            keys: List of hex key strings (without '0x' prefix)
+        """
+        self.user_keys = []
+        for key_str in keys:
+            try:
+                # Remove any whitespace or separators
+                key_str = key_str.replace(' ', '').replace(':', '').replace('-', '')
+                
+                # Convert hex string to bytes
+                key_bytes = bytes.fromhex(key_str)
+                
+                # Determine encryption type based on key length
+                if len(key_bytes) == 10:  # 80 bits = TEA1
+                    self.user_keys.append(('TEA1', key_bytes))
+                elif len(key_bytes) == 16:  # 128 bits = TEA2
+                    self.user_keys.append(('TEA2', key_bytes))
+                elif len(key_bytes) == 32:  # 256 bits = TEA3
+                    self.user_keys.append(('TEA3', key_bytes))
+                else:
+                    logger.warning(f"Invalid key length: {len(key_bytes)} bytes (expected 10, 16, or 32)")
+            except Exception as e:
+                logger.error(f"Failed to parse key '{key_str}': {e}")
+        
+        logger.info(f"Loaded {len(self.user_keys)} user-provided encryption keys")
         
     def symbols_to_bits(self, symbols):
         """
@@ -128,9 +159,17 @@ class TetraDecoder:
             
         return np.array(bits), np.array(mapped_symbols)
     
-    def find_sync(self, bits, threshold=0.85):
+    def find_sync(self, bits, threshold=0.85, return_max_corr=False):
         """
         Find TETRA synchronization pattern (Training Sequence 1).
+        
+        Args:
+            bits: Bit stream to search
+            threshold: Correlation threshold (0.0-1.0)
+            return_max_corr: If True, return (sync_positions, max_corr) tuple
+        
+        Returns:
+            sync_positions list, or (sync_positions, max_corr) if return_max_corr=True
         """
         sync_positions = []
         # Training Sequence 1 (from TetraProtocolParser)
@@ -151,6 +190,8 @@ class TetraDecoder:
         }
         
         if len(bits) < 22:
+            if return_max_corr:
+                return sync_positions, 0.0
             return sync_positions
         
         # Check every bit position (step=1) to ensure we don't miss sync
@@ -166,6 +207,8 @@ class TetraDecoder:
         sync_len = 22
         num_windows = len(bits) - sync_len + 1
         if num_windows <= 0:
+            if return_max_corr:
+                return sync_positions, 0.0
             return sync_positions
             
         # Simple loop is safer and easier to debug than stride_tricks for now
@@ -173,13 +216,20 @@ class TetraDecoder:
         
         i = 0
         max_corr = 0.0
+        # Track all correlations to find best positions
+        all_correlations = []
+        
         while i < num_windows:
             # Try both TS1 and TS2
+            best_corr_at_pos = 0.0
             for name, pattern in self.sync_patterns.items():
                 # Full correlation check - removed fragile "quick check"
                 window = bits[i:i+sync_len]
                 match_count = np.sum(window == pattern)
                 correlation = match_count / sync_len
+                
+                if correlation > best_corr_at_pos:
+                    best_corr_at_pos = correlation
                 
                 if correlation > max_corr:
                     max_corr = correlation
@@ -191,13 +241,40 @@ class TetraDecoder:
                     i += 250  # TETRA frame is ~510 bits
                     break # Found one, move to next frame
             
-            i += 1
+            # Track correlation at each position for adaptive threshold
+            if best_corr_at_pos > 0:
+                all_correlations.append((i, best_corr_at_pos))
             
+            i += 1
+        
+        # If no syncs found but we have a good max correlation close to threshold, use adaptive threshold
+        # This prevents dropping frames when max_corr is just below the threshold (e.g., 0.8182 vs 0.85)
+        if not sync_positions and max_corr > 0.75 and max_corr >= (threshold - 0.15):
+            # Use threshold slightly below max_corr (but not lower than 0.75)
+            # Allow up to 0.02 tolerance below threshold if max_corr is close
+            adaptive_threshold = max(0.75, max_corr - 0.02)  # 2% tolerance
+            if adaptive_threshold < threshold:
+                # Re-search with adaptive threshold - use stored correlations to avoid re-computation
+                sync_positions = []
+                seen_positions = set()
+                for pos, corr in all_correlations:
+                    if corr >= adaptive_threshold and pos not in seen_positions:
+                        sync_positions.append(pos)
+                        seen_positions.add(pos)
+                        # Mark nearby positions as seen to avoid duplicates
+                        for nearby in range(max(0, pos - 250), min(num_windows, pos + 250)):
+                            seen_positions.add(nearby)
+                
+                if sync_positions:
+                    logger.debug(f"Found {len(sync_positions)} syncs at adaptive threshold {adaptive_threshold:.4f} (max: {max_corr:.4f}, original: {threshold:.4f})")
+        
         if not sync_positions:
              logger.debug(f"No sync found at threshold {threshold}. Max correlation: {max_corr:.4f}")
         else:
              logger.debug(f"Found {len(sync_positions)} syncs at threshold {threshold}. Max correlation: {max_corr:.4f}")
         
+        if return_max_corr:
+            return sync_positions, max_corr
         return sync_positions
     
     def decode_frame(self, bits, start_pos, symbols=None):
@@ -489,6 +566,11 @@ class TetraDecoder:
             keys_to_try.append((key, f"{algorithm} key_id={key_id} (from file)"))
             logger.info(f"Trying key from file for {algorithm}")
         
+        # Try user-provided keys FIRST (highest priority)
+        for key_type, key in self.user_keys:
+            if key_type == algorithm:
+                keys_to_try.insert(0, (key, f"{algorithm} user_key (loaded)"))
+        
         # ALWAYS add common keys for bruteforce (OpenEar style)
         if algorithm in self.common_keys:
             for idx, common_key in enumerate(self.common_keys[algorithm]):
@@ -502,7 +584,7 @@ class TetraDecoder:
         for other_alg in ['TEA1', 'TEA2', 'TEA3', 'TEA4']:
             if other_alg != algorithm and other_alg in self.common_keys:
                 for idx, common_key in enumerate(self.common_keys[other_alg][:5]):  # Try first 5
-                    keys_to_try.append((common_key, f"{other_alg} common_key_{idx} (cross-try)"))
+                    keys_to_try.append((common_key, f"{other_alg} common_key_{idx} (cross-try)", other_alg))
         
         # If no keys to try, bail out
         if not keys_to_try:
@@ -517,13 +599,19 @@ class TetraDecoder:
         best_result = None
         best_score = 0
         
-        for key, key_desc in keys_to_try:
+        for item in keys_to_try:
+            if len(item) == 3:
+                key, key_desc, alg_to_use = item
+            else:
+                key, key_desc = item
+                alg_to_use = algorithm
+            
             try:
                 if key is None:
                     # BYPASS mode - use payload as is
                     decrypted_payload = payload_bytes
                 else:
-                    decryptor = TEADecryptor(key, algorithm)
+                    decryptor = TEADecryptor(key, alg_to_use if alg_to_use else algorithm)
                     decrypted_payload = decryptor.decrypt(payload_bytes)
                 
                 # Score the decrypted data (how "good" it looks)
@@ -634,20 +722,21 @@ class TetraDecoder:
         bits, mapped_symbols = self.symbols_to_bits(symbols)
         
         # Find synchronization patterns (Training Sequence)
-        # Use progressively lower thresholds to catch weaker/noisy signals
-        sync_positions = self.find_sync(bits, threshold=0.75)
+        # Use adaptive thresholding based on max correlation to avoid dropping frames
+        # The find_sync function now has built-in adaptive thresholding when max_corr is close to threshold
+        sync_positions, max_corr = self.find_sync(bits, threshold=0.90, return_max_corr=True)
         
         if not sync_positions:
-            sync_positions = self.find_sync(bits, threshold=0.65)  # Lowered from 0.70
+            # Try 0.85 threshold - find_sync will use adaptive threshold if max_corr is close
+            sync_positions, max_corr = self.find_sync(bits, threshold=0.85, return_max_corr=True)
             if not sync_positions:
-                sync_positions = self.find_sync(bits, threshold=0.55)  # Even more lenient
-                if not sync_positions:
-                    # If still no sync found, try to decode at regular intervals anyway
-                    # This helps with signals that have sync but it's corrupted
-                    # TETRA slots are 510 bits, so try every 510 bits
-                    if len(bits) >= self.FRAME_LENGTH:
-                        # Try decoding from start of bit stream (might be misaligned)
-                        sync_positions = [0]
+                # Try 0.80 threshold - find_sync will use adaptive threshold if max_corr is close
+                sync_positions, max_corr = self.find_sync(bits, threshold=0.80, return_max_corr=True)
+                if not sync_positions and max_corr >= 0.75:
+                    # Last resort: use adaptive threshold based on max correlation
+                    adaptive_threshold = max(0.75, max_corr - 0.02)
+                    sync_positions, _ = self.find_sync(bits, threshold=adaptive_threshold, return_max_corr=True)
+                    # Do not go lower than 0.75 for 22-bit sync
         
         # Decode frames
         frames = []
@@ -882,8 +971,15 @@ class TetraDecoder:
                                 if mac_pdu.reassembled_data:
                                     frame_data['is_reassembled'] = True
                                     additional_info['description'] += " (Reassembled)"
+                    else:
+                        # STRICT VALIDATION: If MAC PDU parsing failed, and CRC failed, discard frame
+                        if not burst.crc_ok:
+                            return None
+                            
                 except Exception as e:
                     logger.debug(f"MAC PDU parsing error: {e}")
+                    if not burst.crc_ok:
+                        return None
 
         except Exception as e:
             logger.debug(f"Protocol parsing error: {e}")

@@ -48,6 +48,14 @@ class RTLCapture:
         """Open and configure RTL-SDR device."""
         try:
             self.sdr = RtlSdr()
+            
+            # Validate and round sample rate to nearest valid RTL-SDR rate
+            # Valid rates: 0.225, 0.9, 1.024, 1.536, 1.8, 1.92, 2.048, 2.4, 2.56, 2.88, 3.2 MHz
+            valid_rates = [0.225e6, 0.9e6, 1.024e6, 1.536e6, 1.8e6, 1.92e6, 2.048e6, 2.4e6, 2.56e6, 2.88e6, 3.2e6]
+            closest_rate = min(valid_rates, key=lambda x: abs(x - self.sample_rate))
+            if abs(closest_rate - self.sample_rate) > 0.1e6:  # More than 100kHz difference
+                logger.warning(f"Sample rate {self.sample_rate/1e6:.3f} MHz is not valid for RTL-SDR, using {closest_rate/1e6:.3f} MHz")
+            self.sample_rate = closest_rate
             self.sdr.sample_rate = self.sample_rate
             self.sdr.center_freq = self.frequency
             # Handle gain: 'auto' stays as string, numeric values should be numeric
@@ -119,6 +127,21 @@ class RTLCapture:
         try:
             samples = self.sdr.read_samples(num_samples)
             return samples
+        except (OSError, RuntimeError) as e:
+            error_msg = str(e)
+            # Check for access violation or device errors
+            if "access violation" in error_msg.lower() or "exception" in error_msg.lower():
+                logger.error(f"RTL-SDR device error: {e}")
+                logger.error("Device may be in invalid state. Attempting to recover...")
+                # Try to close and reopen
+                try:
+                    self.sdr.close()
+                except:
+                    pass
+                self.sdr = None
+                raise RuntimeError("RTL-SDR device error - please restart the application")
+            logger.error(f"Failed to read samples: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to read samples: {e}")
             raise
@@ -133,9 +156,13 @@ class RTLCapture:
         if self.sdr is None:
             raise RuntimeError("RTL-SDR device not opened")
         
-        self.frequency = frequency
-        self.sdr.center_freq = frequency
-        logger.debug(f"Frequency changed to {frequency/1e6:.3f} MHz")
+        try:
+            self.frequency = frequency
+            self.sdr.center_freq = frequency
+            logger.debug(f"Frequency changed to {frequency/1e6:.3f} MHz")
+        except Exception as e:
+            logger.error(f"Failed to set frequency: {e}")
+            raise
     
     def close(self):
         """Close RTL-SDR device."""

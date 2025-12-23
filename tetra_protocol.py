@@ -288,9 +288,10 @@ class TetraProtocolParser:
         zeros = len(bits) - ones
         bit_ratio = min(ones, zeros) / max(ones, zeros) if max(ones, zeros) > 0 else 0
         
-        # If bits are reasonably distributed (not all 0s or 1s), consider valid
-        if bit_ratio > 0.15:  # At least 15% of minority bit
-            return True
+        # STRICTER: Random noise often has balanced bits (ratio ~1.0)
+        # But real data also has balanced bits.
+        # The previous check (>0.15) was too loose for noise.
+        # We can't rely on bit ratio alone.
         
         # Heuristic 2: Try actual CRC on payload
         try:
@@ -300,10 +301,12 @@ class TetraProtocolParser:
             
             # Allow some bit errors (TETRA has FEC)
             errors = np.sum(calculated_crc != received_crc)
-            return errors <= 3  # Allow up to 3 bit errors
+            
+            # STRICTER: Only allow 0 errors for CRC check to pass
+            # If we are not doing channel decoding, CRC should match if signal is clean
+            return errors == 0
         except:
-            # If CRC calculation fails, fall back to heuristic
-            return bit_ratio > 0.2
+            return False
     
     def _calculate_crc16(self, bits: np.ndarray) -> np.ndarray:
         """Calculate CRC-16-CCITT (polynomial 0x1021)."""
@@ -388,12 +391,16 @@ class TetraProtocolParser:
                 address_bits = bits[pos:pos+24]
                 address = int(''.join(str(b) for b in address_bits), 2)
                 pos += 24
+            else:
+                return None # Truncated
             
             # Length (6 bits)
             if len(bits) >= pos + 6:
                 length_bits = bits[pos:pos+6]
                 length = int(''.join(str(b) for b in length_bits), 2)
                 pos += 6
+            else:
+                return None # Truncated
                 
             # Data
             # If length is 0, it might mean "rest of slot" or specific rule
@@ -401,6 +408,11 @@ class TetraProtocolParser:
             # Actually, length is in octets (bytes) usually.
             
             data_len_bits = length * 8
+            
+            # STRICT CHECK: Data length cannot exceed remaining bits significantly
+            if data_len_bits > len(bits) - pos + 16: # Allow small margin
+                return None
+            
             if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
                 data_bits = bits[pos:pos + data_len_bits]
             else:
@@ -451,6 +463,12 @@ class TetraProtocolParser:
                     self.mcc = int(''.join(str(b) for b in bits[pos:pos+10]), 2)
                     self.mnc = int(''.join(str(b) for b in bits[pos+10:pos+24]), 2)
                     self.colour_code = int(''.join(str(b) for b in bits[pos+24:pos+30]), 2)
+                    
+                    # STRICT CHECK: MCC/MNC sanity
+                    if self.mcc == 0 or self.mcc > 999: return None
+                    if self.mnc > 9999: return None
+                else:
+                    return None
             
             data_bits = bits[pos:]
             try:
@@ -470,8 +488,16 @@ class TetraProtocolParser:
                 length_bits = bits[pos:pos+6]
                 length = int(''.join(str(b) for b in length_bits), 2)
                 pos += 6
+            else:
+                # If no length field, treat as invalid for MAC-END
+                return None
                 
             data_len_bits = length * 8
+            
+            # STRICT CHECK
+            if data_len_bits > len(bits) - pos + 16:
+                return None
+                
             if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
                 data_bits = bits[pos:pos + data_len_bits]
             else:
@@ -855,15 +881,31 @@ class TetraProtocolParser:
              except:
                 pass
         
+        # Try GSM 7-bit unpacking as last resort
+        try:
+            text = self._unpack_gsm7bit(test_data)
+            if self._is_valid_text(text, threshold=0.5):
+                self.stats['data_messages'] += 1
+                return f"[GSM7] {text}"
+        except:
+            pass
+        
         # Check for Encrypted Binary SDS (High Entropy)
         if len(test_data) > 8:
             unique_bytes = len(set(test_data))
             entropy_ratio = unique_bytes / len(test_data)
             if entropy_ratio > 0.7:
-                return f"[BIN-ENC] SDS (Binary/Encrypted) - {len(test_data)} bytes"
+                # Show hex dump for analysis
+                hex_preview = test_data[:32].hex(' ').upper()
+                if len(test_data) > 32:
+                    hex_preview += "..."
+                return f"[BIN-ENC] SDS (Binary/Encrypted) - {len(test_data)} bytes | {hex_preview}"
 
         # Default to Hex dump for binary data
-        return f"[BIN] {data_stripped.hex(' ').upper()}"
+        hex_dump = data_stripped.hex(' ').upper()
+        if len(hex_dump) > 100:
+            hex_dump = hex_dump[:100] + "..."
+        return f"[BIN] {hex_dump}"
 
     def parse_lip(self, data: bytes) -> Optional[str]:
         """
