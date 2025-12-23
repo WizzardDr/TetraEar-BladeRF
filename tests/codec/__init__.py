@@ -1,0 +1,3 @@
+"""
+Codec verification tests.
+"""

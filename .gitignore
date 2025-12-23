@@ -44,6 +44,7 @@ ENV/
 *.out
 *.txt
 !requirements.txt
+!requirements-dev.txt
 !README.md
 !keys.example.txt
 !test_input_*.txt
@@ -57,6 +58,31 @@ dev_tools/
 
 # PyInstaller
 *.spec
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.hypothesis/
+test-results/
+*.cover
+*.py,cover
+
+# Test artifacts
+.pytest_cache/
+test_*.pyc
+test_*.pyo
+test_*.pyd
+__pycache__/test_*
+
+# CI/CD artifacts
+build_metadata.txt
+TetraEar-v*-Windows.zip
+!release/README.txt
+!release/README.md
 
 # OS
 .DS_Store

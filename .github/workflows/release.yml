@@ -1,0 +1,196 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for version detection
+    
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+    
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+    
+      - name: Run unit tests
+        run: |
+          pytest tests/unit -v --cov=. --cov-report=xml --cov-report=term
+    
+      - name: Run integration tests
+        run: |
+          pytest tests/integration -v
+    
+      - name: Run codec verification tests
+        run: |
+          pytest tests/codec -v -m codec
+    
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  build:
+    name: Build Executable
+    runs-on: windows-latest
+    needs: test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+    
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+    
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+    
+      - name: Build executable
+        run: |
+          python build_exe.py
+        env:
+          CI: true
+    
+      - name: Extract version
+        id: version
+        run: |
+          $metadata = Get-Content dist\build_metadata.txt | Select-String "Version:"
+          $version = $metadata -replace "Version: ", ""
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "Version: $version"
+    
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executable
+          path: |
+            dist/TETRA_Decoder_Modern.exe
+            dist/*.dll
+            dist/tetra_codec/
+            dist/build_metadata.txt
+
+  package:
+    name: Create Release Package
+    runs-on: windows-latest
+    needs: build
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+    
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-executable
+          path: dist/
+    
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+    
+      - name: Create release package
+        run: |
+          python scripts/create_release_package.py
+        env:
+          CI: true
+    
+      - name: Extract version and zip path
+        id: package
+        run: |
+          $output = python scripts/create_release_package.py 2>&1 | Select-String "RELEASE_VERSION="
+          $version = $output -replace "RELEASE_VERSION=", ""
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          
+          $zipOutput = python scripts/create_release_package.py 2>&1 | Select-String "RELEASE_ZIP="
+          $zipPath = $zipOutput -replace "RELEASE_ZIP=", ""
+          echo "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+      
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            TetraEar-v*-Windows.zip
+            release/
+
+  release:
+    name: Create GitHub Release
+    runs-on: windows-latest
+    needs: package
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+    
+      - name: Download release package
+        uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: ./
+    
+      - name: Extract version
+        id: version
+        run: |
+          $zipFile = Get-ChildItem -Filter "TetraEar-v*-Windows.zip" | Select-Object -First 1
+          if ($zipFile) {
+            $version = $zipFile.Name -replace "TetraEar-v", "" -replace "-Windows.zip", ""
+            echo "version=$version" >> $env:GITHUB_OUTPUT
+            echo "Version: $version"
+          } else {
+            echo "version=dev" >> $env:GITHUB_OUTPUT
+          }
+    
+      - name: Get release notes
+        id: release_notes
+        run: |
+          if (Test-Path "RELEASE_NOTES.md") {
+            $notes = Get-Content "RELEASE_NOTES.md" -Raw
+            $notes = $notes -replace "`"", "\`""
+            echo "notes<<EOF" >> $env:GITHUB_OUTPUT
+            echo "$notes" >> $env:GITHUB_OUTPUT
+            echo "EOF" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "notes=Automated release" >> $env:GITHUB_OUTPUT
+          }
+    
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: TetraEar v${{ steps.version.outputs.version }}
+          body: ${{ steps.release_notes.outputs.notes }}
+          files: |
+            TetraEar-v*-Windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

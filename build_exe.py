@@ -8,6 +8,8 @@ import sys
 import shutil
 import subprocess
 from pathlib import Path
+from datetime import datetime
+import re
 
 def check_pyinstaller():
     """Check if PyInstaller is installed, install if not."""
@@ -29,18 +31,104 @@ def get_project_root():
     """Get the project root directory."""
     return Path(__file__).parent.absolute()
 
+
+def get_version():
+    """
+    Extract version from git tag, __version__, or use timestamp.
+    
+    Returns:
+        Version string (e.g., "2.1.0" or "2.1.0.dev20231223")
+    """
+    # Try to get version from git tag
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=get_project_root()
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            version = result.stdout.strip()
+            # Remove 'v' prefix if present
+            version = re.sub(r'^v', '', version)
+            # Remove commit hash suffix for clean tags
+            version = re.sub(r'-g[0-9a-f]+$', '', version)
+            # Remove -dirty suffix for CI/CD
+            version = re.sub(r'-dirty$', '', version)
+            return version
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+        pass
+    
+    # Try to get version from __version__ in main module
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "tetra_gui_modern",
+            get_project_root() / "tetra_gui_modern.py"
+        )
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if hasattr(module, '__version__'):
+                return module.__version__
+    except Exception:
+        pass
+    
+    # Fallback to timestamp-based version
+    timestamp = datetime.now().strftime("%Y%m%d")
+    return f"2.1.0.dev{timestamp}"
+
+
+def get_git_commit_hash():
+    """Get current git commit hash (short)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=get_project_root()
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+        pass
+    return None
+
 def build_exe():
-    """Build the executable."""
+    """
+    Build the executable.
+    
+    Returns:
+        tuple: (success: bool, version: str, metadata: dict)
+    """
     project_root = get_project_root()
     script_path = project_root / "tetra_gui_modern.py"
     
+    # Get version and metadata
+    version = get_version()
+    commit_hash = get_git_commit_hash()
+    build_timestamp = datetime.now().isoformat()
+    
+    # Support environment variable overrides
+    build_output_dir = os.environ.get("BUILD_OUTPUT_DIR")
+    if build_output_dir:
+        dist_dir = Path(build_output_dir)
+    else:
+        dist_dir = project_root / "dist"
+    
     if not script_path.exists():
         print(f"[ERROR] {script_path} not found!")
-        return False
+        return False, version, {}
     
     print("=" * 60)
     print("TETRA Decoder Modern GUI - Build Script")
     print("=" * 60)
+    print(f"Version: {version}")
+    if commit_hash:
+        print(f"Commit: {commit_hash}")
+    print(f"Build Time: {build_timestamp}")
     print()
     
     # Check PyInstaller
@@ -49,7 +137,7 @@ def build_exe():
     
     # Prepare build directory
     build_dir = project_root / "build"
-    dist_dir = project_root / "dist"
+    # dist_dir already set above from environment variable or default
     
     print(f"Project root: {project_root}")
     print(f"Script: {script_path}")
@@ -191,31 +279,62 @@ def build_exe():
                 shutil.copytree(codec_dir, codec_dst, dirs_exist_ok=True)
                 print(f"  [OK] Copied codec directory")
             
-            return True
+            # Build metadata
+            metadata = {
+                'version': version,
+                'commit_hash': commit_hash,
+                'build_timestamp': build_timestamp,
+                'exe_path': str(exe_path),
+                'exe_size_mb': exe_path.stat().st_size / (1024*1024),
+            }
+            
+            # Write metadata to file for CI/CD
+            metadata_file = dist_dir / "build_metadata.txt"
+            with open(metadata_file, 'w') as f:
+                f.write(f"Version: {version}\n")
+                f.write(f"Commit: {commit_hash or 'unknown'}\n")
+                f.write(f"Build Time: {build_timestamp}\n")
+                f.write(f"Executable: {exe_path}\n")
+                f.write(f"Size: {metadata['exe_size_mb']:.2f} MB\n")
+            
+            return True, version, metadata
         else:
             print("[ERROR] Executable not found after build")
-            return False
+            return False, version, {}
             
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] Build failed with error code {e.returncode}")
-        return False
+        return False, version, {}
     except Exception as e:
         print(f"[ERROR] Build error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return False, version, {}
 
 def main():
     """Main entry point."""
-    success = build_exe()
+    # Check if running in CI/CD (no TTY)
+    is_ci = not sys.stdin.isatty() or os.environ.get("CI") == "true"
+    
+    success, version, metadata = build_exe()
     if not success:
         sys.exit(1)
     
-    print("Press Enter to exit...")
-    try:
-        input()
-    except:
-        pass
+    # In CI/CD, don't wait for user input
+    if not is_ci:
+        print("Press Enter to exit...")
+        try:
+            input()
+        except:
+            pass
+    
+    # Print version for CI/CD scripts
+    if is_ci:
+        print(f"BUILD_VERSION={version}")
+        if metadata.get('commit_hash'):
+            print(f"BUILD_COMMIT={metadata['commit_hash']}")
+    
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
