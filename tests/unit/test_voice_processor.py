@@ -6,6 +6,7 @@ import pytest
 import numpy as np
 import struct
 import os
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from tetraear.audio.voice import VoiceProcessor
 
@@ -62,48 +63,56 @@ class TestVoiceProcessor:
     
     def test_decode_frame_valid_format(self, sample_tetra_frame_binary, tmp_path):
         """Test decode with valid frame format."""
-        codec = tmp_path / "cdecoder.exe"
-        codec.write_bytes(b"")
-        processor = VoiceProcessor(codec_path=codec)
+        codec_dir = tmp_path / "tetra_codec" / "bin"
+        codec_dir.mkdir(parents=True, exist_ok=True)
+        (codec_dir / "cdecoder.exe").write_bytes(b"")
+        (codec_dir / "sdecoder.exe").write_bytes(b"")
+        processor = VoiceProcessor(codec_dir=codec_dir)
         
         # Mock subprocess to avoid actually calling codec
         with patch('tetraear.audio.voice.subprocess.run') as mock_run:
-            # Mock successful codec execution
-            mock_run.return_value = MagicMock(returncode=0)
-            
-            # Mock output file
-            with patch('tetraear.audio.voice.os.path.exists', return_value=True):
-                with patch('tetraear.audio.voice.os.path.getsize', return_value=552):
-                    with patch('builtins.open', create=True) as mock_open:
-                        # Mock file read - return PCM data
-                        pcm_data = bytes([0x00] * 552)
-                        mock_file = MagicMock()
-                        mock_file.read.return_value = pcm_data
-                        mock_open.return_value.__enter__.return_value = mock_file
-                        
-                        result = processor.decode_frame(sample_tetra_frame_binary)
-                        # Should return audio array (may be empty if codec fails)
-                        assert isinstance(result, np.ndarray)
+            def _side_effect(args, stdout=None, stderr=None, check=None, timeout=None):
+                # args: [exe, in, out]
+                exe = os.path.basename(str(args[0])).lower()
+                out_path = str(args[2])
+                if "cdecoder" in exe:
+                    # Write dummy serial bits output (e.g., 2 frames * 138 int16)
+                    Path(out_path).write_bytes(bytes([0x00] * 552))
+                    return MagicMock(returncode=0, stdout=b"", stderr=b"")
+                if "sdecoder" in exe:
+                    # Write dummy synth output (int16 samples)
+                    samples = (np.ones(320, dtype=np.int16) * 1000).tobytes()
+                    Path(out_path).write_bytes(samples)
+                    return MagicMock(returncode=0, stdout=b"", stderr=b"")
+                return MagicMock(returncode=1, stdout=b"", stderr=b"")
+
+            mock_run.side_effect = _side_effect
+
+            result = processor.decode_frame(sample_tetra_frame_binary)
+            assert isinstance(result, np.ndarray)
+            assert result.size > 0
     
     def test_decode_frame_codec_failure(self, sample_tetra_frame_binary, tmp_path):
         """Test decode when codec fails."""
-        codec = tmp_path / "cdecoder.exe"
-        codec.write_bytes(b"")
-        processor = VoiceProcessor(codec_path=codec)
+        codec_dir = tmp_path / "tetra_codec" / "bin"
+        codec_dir.mkdir(parents=True, exist_ok=True)
+        (codec_dir / "cdecoder.exe").write_bytes(b"")
+        (codec_dir / "sdecoder.exe").write_bytes(b"")
+        processor = VoiceProcessor(codec_dir=codec_dir)
         
         with patch('tetraear.audio.voice.subprocess.run') as mock_run:
             # Mock codec failure
-            mock_run.return_value = MagicMock(returncode=1)
-            
-            with patch('tetraear.audio.voice.os.path.exists', return_value=False):
-                result = processor.decode_frame(sample_tetra_frame_binary)
-                assert len(result) == 0
+            mock_run.return_value = MagicMock(returncode=1, stdout=b"", stderr=b"")
+            result = processor.decode_frame(sample_tetra_frame_binary)
+            assert len(result) == 0
     
     def test_decode_frame_timeout(self, sample_tetra_frame_binary, tmp_path):
         """Test decode when codec times out."""
-        codec = tmp_path / "cdecoder.exe"
-        codec.write_bytes(b"")
-        processor = VoiceProcessor(codec_path=codec)
+        codec_dir = tmp_path / "tetra_codec" / "bin"
+        codec_dir.mkdir(parents=True, exist_ok=True)
+        (codec_dir / "cdecoder.exe").write_bytes(b"")
+        (codec_dir / "sdecoder.exe").write_bytes(b"")
+        processor = VoiceProcessor(codec_dir=codec_dir)
         
         with patch('tetraear.audio.voice.subprocess.run') as mock_run:
             import subprocess

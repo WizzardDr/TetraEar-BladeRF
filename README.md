@@ -19,7 +19,7 @@
 - **Live Status**: Real-time signal strength, sync rate, and CRC validation
 
 ### 🔊 **Voice Decoding**
-- **ACELP Codec**: Integrated TETRA voice decoder (requires cdecoder.exe)
+- **ACELP Codec**: Uses ETSI reference codec (`cdecoder.exe` + `sdecoder.exe`) for voice decoding
 - **Real-time Audio**: Monitor decoded voice in real-time
 - **Quality Validation**: Automatic amplitude check (configurable)
 - **Recording**: Save decoded audio to WAV files
@@ -58,7 +58,7 @@
 - **Python**: 3.8 or higher
 - **RTL-SDR**: Compatible USB dongle with drivers installed
 - **Operating System**: Windows or Linux
-- **Optional**: TETRA Codec binaries (cdecoder.exe) for voice decoding
+- **Optional**: TETRA speech codec binaries (`cdecoder.exe` + `sdecoder.exe`) for voice decoding
 
 ---
 
@@ -202,10 +202,10 @@ Click the **⚙️ Settings** button to access:
 1. Use **SCAN** mode to sweep frequency range
 2. Look for strong, consistent spikes in waterfall (~25 kHz wide)
 3. TETRA signals typically appear as 4 carriers (4x6.25 kHz slots)
-4. Enable **Follow Frequency (AFC)** to auto-track signal
+4. Enable **Auto-Follow Spike (AFC)** to auto-track signal
 
 ### 🔊 Voice Decoding
-- Ensure `cdecoder.exe` is in `tetraear/tetra_codec/bin/`
+- Ensure `cdecoder.exe` and `sdecoder.exe` are in `tetraear/tetra_codec/bin/`
 - Check **Monitor Audio** to hear decoded voice
 - Adjust gain (45-50 dB recommended)
 - Voice frames appear with 🔊 icon in Decoded Frames tab
@@ -244,7 +244,7 @@ Click the **⚙️ Settings** button to access:
 - **Interference**: Try different location or frequency
 
 ### ❌ No Voice Audio (Amplitude 0.0)
-- **Codec Missing**: Verify `cdecoder.exe` exists
+- **Codec Missing**: Verify `cdecoder.exe` and `sdecoder.exe` exist
 - **Encrypted Voice**: Load decryption keys
 - **Wrong Frame Type**: Verify it's a Traffic/Voice frame
 

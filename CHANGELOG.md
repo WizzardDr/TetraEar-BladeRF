@@ -1,10 +1,11 @@
 # TetraEar Changelog
 
-## Version 2.1.1 - December 2025
+## Version 2.1.2 - December 2025
 
 ### 🐛 Bug Fixes
 - **GSM7 Decoding**: Correct GSM 03.38 7-bit unpacking for SDS text messages.
 - **SDS Display**: Keep frames `Description` clean by showing SDS/text in a dedicated `Message` column.
+- **Voice Codec Chain**: Use ETSI `cdecoder` → `sdecoder` pipeline for synthesized audio output.
 
 ### ✨ Improvements
 - **Binary SDS (Clear)**: `[BIN]` output includes PID + richer previews to help interpret open-air binary payloads.

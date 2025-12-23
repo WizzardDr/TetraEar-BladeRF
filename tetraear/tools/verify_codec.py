@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Comprehensive TETRA Codec Verification Script
-Tests all 4 codec executables (cdecoder, ccoder, sdecoder, scoder)
-with proper TETRA frame formats.
+
+These binaries are from ETSI TS 300 395-2 (speech codec reference implementation):
+- cdecoder/ccoder: channel decoder/coder (soft bits <-> serial vocoder bits)
+- sdecoder/scoder: speech decoder/coder (serial vocoder bits <-> speech samples)
 """
 
 import os
@@ -55,9 +57,9 @@ def create_tetra_frame_binary():
     return bytes(frame)
 
 def test_cdecoder():
-    """Test cdecoder.exe (voice decoder)."""
+    """Test cdecoder.exe (channel decoder: soft bits -> serial vocoder bits)."""
     print("\n" + "="*60)
-    print("Testing cdecoder.exe (Voice Decoder)")
+    print("Testing cdecoder.exe (Channel Decoder)")
     print("="*60)
     
     codec_path = CODECS['cdecoder']
@@ -141,9 +143,9 @@ def test_cdecoder():
             pass
 
 def test_ccoder():
-    """Test ccoder.exe (voice encoder)."""
+    """Test ccoder.exe (channel coder: serial vocoder bits -> soft bits)."""
     print("\n" + "="*60)
-    print("Testing ccoder.exe (Voice Encoder)")
+    print("Testing ccoder.exe (Channel Coder)")
     print("="*60)
     
     codec_path = CODECS['ccoder']
@@ -216,52 +218,66 @@ def test_ccoder():
             pass
 
 def test_sdecoder():
-    """Test sdecoder.exe (signaling decoder)."""
+    """Test sdecoder.exe (speech decoder: serial vocoder bits -> synthesized samples)."""
     print("\n" + "="*60)
-    print("Testing sdecoder.exe (Signaling Decoder)")
+    print("Testing sdecoder.exe (Speech Decoder)")
     print("="*60)
     
     codec_path = CODECS['sdecoder']
     if not test_codec_exists('sdecoder', codec_path):
         return False
     
-    # sdecoder likely uses similar format to cdecoder
-    # Create test input file
+    # Build a minimal "serial bits" file by running cdecoder first (soft bits -> serial bits),
+    # then validate sdecoder produces synthesized output samples.
+    cdecoder_path = CODECS['cdecoder']
+    if not test_codec_exists('cdecoder', cdecoder_path):
+        print("  [SKIP] cdecoder.exe missing; cannot generate serial bits for sdecoder")
+        return False
+
     with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.tet') as tmp_in:
         frame_data = create_tetra_frame_binary()
         tmp_in.write(frame_data)
         tmp_in_path = tmp_in.name
-    
-    tmp_out_path = tmp_in_path + ".out"
+
+    tmp_serial_path = tmp_in_path + ".serial"
+    tmp_out_path = tmp_in_path + ".synth"
     
     try:
-        result = subprocess.run(
-            [codec_path, tmp_in_path, tmp_out_path],
+        result1 = subprocess.run(
+            [cdecoder_path, tmp_in_path, tmp_serial_path],
             capture_output=True,
             text=True,
             timeout=10
         )
-        
+
+        if not os.path.exists(tmp_serial_path) or os.path.getsize(tmp_serial_path) == 0:
+            print("  [FAIL] cdecoder did not produce serial bits for sdecoder")
+            if result1.stderr:
+                print(f"  cdecoder stderr: {result1.stderr[:200]}")
+            return False
+
+        result2 = subprocess.run(
+            [codec_path, tmp_serial_path, tmp_out_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
         if os.path.exists(tmp_out_path):
             output_size = os.path.getsize(tmp_out_path)
             print(f"  Output file size: {output_size} bytes")
-            
             if output_size > 0:
-                print("  [OK] sdecoder produced output")
-                if result.returncode == 0:
+                print("  [OK] sdecoder produced synthesized output")
+                if result2.returncode == 0:
                     print("  [OK] sdecoder completed successfully")
-                    return True
                 else:
-                    print(f"  [WARN] sdecoder returned code {result.returncode}")
-                    return True
-            else:
-                print("  [FAIL] sdecoder produced empty output")
-                return False
-        else:
-            print("  [FAIL] sdecoder did not create output file")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:200]}")
-            return False
+                    print(f"  [WARN] sdecoder returned code {result2.returncode}")
+                return True
+
+        print("  [FAIL] sdecoder did not create output file or produced empty output")
+        if result2.stderr:
+            print(f"  sdecoder stderr: {result2.stderr[:200]}")
+        return False
             
     except Exception as e:
         print(f"  [FAIL] Error running sdecoder: {e}")
@@ -269,13 +285,15 @@ def test_sdecoder():
     finally:
         try:
             os.remove(tmp_in_path)
+            if os.path.exists(tmp_serial_path):
+                os.remove(tmp_serial_path)
             if os.path.exists(tmp_out_path):
                 os.remove(tmp_out_path)
         except:
             pass
 
 def test_scoder():
-    """Test scoder.exe (signaling encoder)."""
+    """Test scoder.exe (speech coder: speech samples -> serial vocoder bits + local synthesis)."""
     print("\n" + "="*60)
     print("Testing scoder.exe (Signaling Encoder)")
     print("="*60)

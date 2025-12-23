@@ -81,7 +81,7 @@ class TestCodecVerification:
     
     @pytest.mark.skipif(not codec_exists('cdecoder'), reason="cdecoder.exe not found")
     def test_cdecoder(self):
-        """Test cdecoder.exe (voice decoder)."""
+        """Test cdecoder.exe (channel decoder: soft bits -> serial vocoder bits)."""
         codec_path = self.codecs['cdecoder']
         if codec_path is None:
             pytest.skip("cdecoder.exe not found")
@@ -137,7 +137,7 @@ class TestCodecVerification:
     
     @pytest.mark.skipif(not codec_exists('ccoder'), reason="ccoder.exe not found")
     def test_ccoder(self):
-        """Test ccoder.exe (voice encoder)."""
+        """Test ccoder.exe (channel coder: serial vocoder bits -> soft bits)."""
         codec_path = self.codecs['ccoder']
         if codec_path is None:
             pytest.skip("ccoder.exe not found")
@@ -190,30 +190,44 @@ class TestCodecVerification:
     
     @pytest.mark.skipif(not codec_exists('sdecoder'), reason="sdecoder.exe not found")
     def test_sdecoder(self):
-        """Test sdecoder.exe (signaling decoder)."""
+        """Test sdecoder.exe (speech decoder: serial vocoder bits -> synthesized samples)."""
         codec_path = self.codecs['sdecoder']
         if codec_path is None:
             pytest.skip("sdecoder.exe not found")
-        
-        # Create test input file
+
+        # Generate serial bits using cdecoder first, then run sdecoder on that output.
+        cdecoder_path = self.codecs.get('cdecoder')
+        if cdecoder_path is None:
+            pytest.skip("cdecoder.exe not found (required to generate serial bits for sdecoder)")
+
         with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.tet') as tmp_in:
             frame_data = create_tetra_frame_binary()
             tmp_in.write(frame_data)
             tmp_in_path = tmp_in.name
-        
-        tmp_out_path = tmp_in_path + ".out"
+
+        tmp_serial_path = tmp_in_path + ".serial"
+        tmp_out_path = tmp_in_path + ".synth"
         
         try:
-            result = subprocess.run(
-                [str(codec_path), tmp_in_path, tmp_out_path],
+            result1 = subprocess.run(
+                [str(cdecoder_path), tmp_in_path, tmp_serial_path],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
-            
+
+            if not os.path.exists(tmp_serial_path) or os.path.getsize(tmp_serial_path) == 0:
+                pytest.skip(f"cdecoder did not create serial bits file (code {result1.returncode})")
+
+            result2 = subprocess.run(
+                [str(codec_path), tmp_serial_path, tmp_out_path],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
             if os.path.exists(tmp_out_path):
                 output_size = os.path.getsize(tmp_out_path)
-                # sdecoder may produce output even with non-zero return code
                 if output_size > 0:
                     # Output exists, test passes
                     pass
@@ -225,6 +239,8 @@ class TestCodecVerification:
             try:
                 if os.path.exists(tmp_in_path):
                     os.remove(tmp_in_path)
+                if os.path.exists(tmp_serial_path):
+                    os.remove(tmp_serial_path)
                 if os.path.exists(tmp_out_path):
                     os.remove(tmp_out_path)
             except:
@@ -232,7 +248,7 @@ class TestCodecVerification:
     
     @pytest.mark.skipif(not codec_exists('scoder'), reason="scoder.exe not found")
     def test_scoder(self):
-        """Test scoder.exe (signaling encoder)."""
+        """Test scoder.exe (speech coder: speech samples -> serial vocoder bits)."""
         codec_path = self.codecs['scoder']
         if codec_path is None:
             pytest.skip("scoder.exe not found")

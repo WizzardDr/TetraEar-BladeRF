@@ -1,4 +1,4 @@
-# TetraEar v2.1.1 - Release Notes
+# TetraEar v2.1.2 - Release Notes
 
 This file is bundled into the Windows release zip and used as the GitHub Release body. Update it for every release.
 
@@ -8,6 +8,7 @@ This file is bundled into the Windows release zip and used as the GitHub Release
 - Windows release packaging includes docs + examples in the zip.
 - Frames table now has a dedicated `Message` column (SDS/text snippets), keeping `Description` clean.
 - GSM 7-bit (GSM 03.38) decoding improved; binary SDS now shows richer `[BIN]` details when clear.
+- Voice decoding now uses the correct ETSI codec chain: `cdecoder.exe` (channel) → `sdecoder.exe` (speech) to produce real audio samples.
 
 ## Tested & Verified (Real RF)
 Successfully tested on a real TETRA frequency (392.240 MHz) with the following results:
