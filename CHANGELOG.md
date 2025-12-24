@@ -1,5 +1,11 @@
 # TetraEar Changelog
 
+## Version 2.2 - December 2025
+
+### 📦 Release
+- **Windows build refresh**: Rebuilt and repackaged the Windows x64 binary for v2.2.
+- **No functional changes**: Same functionality as v2.1.2 (version/tag bump only).
+
 ## Version 2.1.2 - December 2025
 
 ### 🐛 Bug Fixes
