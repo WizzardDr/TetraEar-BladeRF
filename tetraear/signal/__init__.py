@@ -16,6 +16,9 @@ def __getattr__(name):
     elif name == "BladeRFCapture":
         from tetraear.signal.capture import BladeRFCapture
         return BladeRFCapture
+    elif name == "list_bladerf_devices":
+        from tetraear.signal.capture import list_bladerf_devices
+        return list_bladerf_devices
     elif name == "TetraSignalDetector":
         from tetraear.signal.scanner import TetraSignalDetector
         return TetraSignalDetector
@@ -27,6 +30,7 @@ def __getattr__(name):
 __all__ = [
     "SignalProcessor",
     "BladeRFCapture",
+    "list_bladerf_devices",
     "TetraSignalDetector",
     "FrequencyScanner",
 ]

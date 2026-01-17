@@ -38,10 +38,46 @@ except (ImportError, OSError):
 logger = logging.getLogger(__name__)
 
 
+def list_bladerf_devices():
+    """
+    List all connected BladeRF devices.
+    
+    Returns:
+        list: List of dicts with device info, or empty list if none found
+        
+    Example:
+        devices = list_bladerf_devices()
+        for dev in devices:
+            print(f"Device: {dev['serial']} (Backend: {dev['backend']})")
+    """
+    if not BLADERF_AVAILABLE:
+        logger.warning("BladeRF library not available")
+        return []
+    
+    try:
+        devices = []
+        device_list = bladerf.get_device_list()
+        
+        for device_info in device_list:
+            device_dict = {
+                'backend': device_info.backend,
+                'device': device_info.device,
+                'instance': device_info.instance,
+                'serial': device_info.serial,
+            }
+            devices.append(device_dict)
+            logger.debug(f"Found BladeRF: {device_dict}")
+        
+        return devices
+    except Exception as e:
+        logger.error(f"Error listing BladeRF devices: {e}")
+        return []
+
+
 class BladeRFCapture:
     """Handles BladeRF device configuration and signal capture."""
     
-    def __init__(self, frequency=400e6, sample_rate=1.8e6, gain='auto'):
+    def __init__(self, frequency=400e6, sample_rate=1.8e6, gain='auto', device_identifier=None):
         """
         Initialize BladeRF capture.
         
@@ -49,10 +85,13 @@ class BladeRFCapture:
             frequency: Center frequency in Hz
             sample_rate: Sample rate in Hz
             gain: Gain setting ('auto' for default mode, or numeric value 0-60 dB for manual mode)
+            device_identifier: Optional device identifier (serial number or device string).
+                              If None, opens first available device.
         """
         self.frequency = frequency
         self.sample_rate = sample_rate
         self.gain = gain
+        self.device_identifier = device_identifier
         self.device = None
         
     def open(self):
@@ -70,8 +109,13 @@ class BladeRFCapture:
             return False
         
         try:
-            # Open first available BladeRF device
-            self.device = bladerf.open()
+            # Open BladeRF device (specific or first available)
+            if self.device_identifier:
+                logger.info(f"Opening BladeRF device: {self.device_identifier}")
+                self.device = bladerf.open(self.device_identifier)
+            else:
+                logger.info("Opening first available BladeRF device")
+                self.device = bladerf.open()
             
             # Validate sample rate for BladeRF
             # BladeRF generally supports: 160 kHz - 40 MHz, but common rates are
