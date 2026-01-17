@@ -3766,9 +3766,11 @@ class ModernTetraGUI(QMainWindow):
         for i, device in enumerate(devices):
             serial = device.get('serial', 'Unknown')
             backend = device.get('backend', 'unknown')
-            device_num = device.get('device', 0)
             instance = device.get('instance', 0)
-            display_text = f"{backend}:device={device_num},instance={instance} (S/N: {serial})"
+            usb_bus = device.get('usb_bus', 0)
+            usb_addr = device.get('usb_addr', 0)
+            # Display format: Backend:Bus:Addr Instance=N (Serial)
+            display_text = f"{backend}:bus={usb_bus}:addr={usb_addr} instance={instance} (S/N: {serial})"
             self.device_combo.addItem(display_text, userData=serial)
         
         # Try to restore previous selection

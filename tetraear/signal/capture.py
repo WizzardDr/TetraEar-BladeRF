@@ -48,7 +48,7 @@ def list_bladerf_devices():
     Example:
         devices = list_bladerf_devices()
         for dev in devices:
-            print(f"Serial: {dev['serial_str']} (Bus: {dev['usb_bus']}, Addr: {dev['usb_addr']})")
+            print(f"Serial: {dev['serial']} (Bus: {dev['usb_bus']}, Addr: {dev['usb_addr']})")
     """
     if not BLADERF_AVAILABLE:
         logger.warning("BladeRF library not available")
@@ -65,17 +65,18 @@ def list_bladerf_devices():
         
         for device_info in device_list:
             # DevInfo is a namedtuple with: backend, serial, usb_bus, usb_addr, instance
+            # serial is bytes, need to decode to string
+            serial_str = device_info.serial.decode('utf-8') if isinstance(device_info.serial, bytes) else str(device_info.serial)
+            
             device_dict = {
                 'backend': str(device_info.backend),
-                'serial': device_info.serial.decode('utf-8') if isinstance(device_info.serial, bytes) else device_info.serial,
-                'serial_str': device_info.serial_str,  # String property for convenience
+                'serial': serial_str,
                 'usb_bus': device_info.usb_bus,
                 'usb_addr': device_info.usb_addr,
                 'instance': device_info.instance,
-                'devstr': device_info.devstr,  # Device string for bladerf.open()
             }
             devices.append(device_dict)
-            logger.debug(f"Found BladeRF: Serial={device_dict['serial_str']}, Bus={device_dict['usb_bus']}, Addr={device_dict['usb_addr']}")
+            logger.debug(f"Found BladeRF: Serial={serial_str}, Bus={device_info.usb_bus}, Addr={device_info.usb_addr}")
         
         return devices
     except Exception as e:

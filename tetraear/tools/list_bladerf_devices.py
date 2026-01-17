@@ -84,11 +84,12 @@ Examples:
         print(f"Device {i}:")
         print(f"  Serial:   {device['serial']}")
         print(f"  Backend:  {device['backend']}")
-        print(f"  Device:   {device['device']}")
+        print(f"  USB Bus:  {device['usb_bus']}")
+        print(f"  USB Addr: {device['usb_addr']}")
         print(f"  Instance: {device['instance']}")
         
         # Build device identifier string
-        device_id = f"{device['backend']}:device={device['device']},instance={device['instance']}"
+        device_id = f"{device['backend']}:bus={device['usb_bus']}:addr={device['usb_addr']} instance={device['instance']}"
         print(f"  ID:       {device_id}")
         print()
     
