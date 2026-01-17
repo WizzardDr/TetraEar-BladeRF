@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 
-from tetraear.signal.capture import RTLCapture
+from tetraear.signal.capture import BladeRFCapture
 from tetraear.signal.processor import SignalProcessor
 from tetraear.core.decoder import TetraDecoder
 from tetraear.audio.voice import VoiceProcessor
@@ -75,7 +75,7 @@ def main():
     keys = load_keys('common_keys.txt')
     print(f"[*] Loaded {len(keys)} keys")
     
-    capture = RTLCapture(frequency=frequency_hz, sample_rate=sample_rate_hz, gain="auto")
+    capture = BladeRFCapture(frequency=frequency_hz, sample_rate=sample_rate_hz, gain="auto")
     if not capture.open():
         print("[FAIL] Could not open RTL-SDR")
         return 1

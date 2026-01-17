@@ -38,9 +38,9 @@ The executable is standalone and includes:
 - All Python dependencies
 - PyQt6 libraries
 - NumPy, SciPy, and other scientific libraries
-- RTL-SDR libraries
+- BladeRF libraries
 - TETRA codec executables
-- Required DLLs (`tetraear/bin/librtlsdr.dll`, `tetraear/bin/libusb-1.0.dll`)
+- Required DLLs (if needed: `tetraear/bin/libusb-1.0.dll`)
 
 You can distribute the single `.exe` file along with:
 - The `tetraear/tetra_codec/bin/` directory (if not bundled correctly)
@@ -78,7 +78,6 @@ If you prefer to build manually:
 pyinstaller --name=TETRA_Decoder_Modern \
     --onefile \
     --windowed \
-    --add-data="tetraear/bin/librtlsdr.dll;tetraear/bin" \
     --add-data="tetraear/bin/libusb-1.0.dll;tetraear/bin" \
     --add-data="tetraear/tetra_codec/bin/*.exe;tetraear/tetra_codec/bin" \
     --add-data="tetraear/assets/*;tetraear/assets" \

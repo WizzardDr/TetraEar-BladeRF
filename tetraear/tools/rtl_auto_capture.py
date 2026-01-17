@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Auto-capture TETRA frames with RTL-SDR and stop when clear data appears.
+Auto-capture TETRA frames with BladeRF and stop when clear data appears.
 
 This script continuously captures IQ samples, demodulates, decodes frames,
 and stops when it finds readable text or non-silent voice audio.
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tetraear.signal.capture import RTLCapture
+from tetraear.signal.capture import BladeRFCapture
 from tetraear.signal.processor import SignalProcessor
 from tetraear.core.decoder import TetraDecoder
 from tetraear.audio.voice import VoiceProcessor
@@ -142,9 +142,9 @@ def main() -> int:
     frequency_hz = args.frequency * 1e6
     sample_rate_hz = args.sample_rate * 1e6
 
-    capture = RTLCapture(frequency=frequency_hz, sample_rate=sample_rate_hz, gain=args.gain)
+    capture = BladeRFCapture(frequency=frequency_hz, sample_rate=sample_rate_hz, gain=args.gain)
     if not capture.open():
-        print("[FAIL] Could not open RTL-SDR device.")
+        print("[FAIL] Could not open BladeRF device.")
         return 1
 
     decoder = TetraDecoder(auto_decrypt=True)

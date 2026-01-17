@@ -71,26 +71,25 @@ class TestTetraSignalDetector:
         assert 0.0 <= confidence <= 1.0
     
     def test_scan_frequency_range_mock(self):
-        """Test frequency scanning with mocked RTL-SDR."""
+        """Test frequency scanning with mocked BladeRF."""
         import tetraear.signal.capture as capture_module
-        from tetraear.signal.capture import RTLCapture
+        from tetraear.signal.capture import BladeRFCapture
         
         detector = TetraSignalDetector()
         
-        # Mock RTL-SDR capture
-        original_available = capture_module.RTL_SDR_AVAILABLE
+        # Mock BladeRF capture
+        original_available = capture_module.BLADERF_AVAILABLE
         try:
-            capture_module.RTL_SDR_AVAILABLE = True
-            with patch.object(capture_module, "RtlSdr") as mock_rtl:
-                mock_sdr = MagicMock()
-                mock_rtl.return_value = mock_sdr
-                mock_sdr.get_device_serial_addresses.return_value = ["00000001"]
+            capture_module.BLADERF_AVAILABLE = True
+            with patch.object(capture_module, "bladerf") as mock_bladerf:
+                mock_device = MagicMock()
+                mock_bladerf.open.return_value = mock_device
 
                 # Mock sample reading
                 mock_samples = np.random.randn(10000) + 1j * np.random.randn(10000)
-                mock_sdr.read_samples.return_value = mock_samples
+                mock_device.rx.return_value = mock_samples
 
-                capture = RTLCapture()
+                capture = BladeRFCapture()
                 assert capture.open() is True
 
                 samples = capture.read_samples(10000)
@@ -101,7 +100,7 @@ class TestTetraSignalDetector:
                 assert isinstance(is_tetra, bool)
                 assert isinstance(confidence, float)
         finally:
-            capture_module.RTL_SDR_AVAILABLE = original_available
+            capture_module.BLADERF_AVAILABLE = original_available
     
     def test_signal_strength_calculation(self, sample_iq_samples):
         """Test signal strength calculation."""

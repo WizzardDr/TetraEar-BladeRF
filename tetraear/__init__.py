@@ -2,7 +2,7 @@
 TetraEar - Professional TETRA Decoder
 
 A modern, professional TETRA (Terrestrial Trunked Radio) decoder and analyzer
-for RTL-SDR with real-time voice decoding, encryption support, and an intuitive GUI.
+for BladeRF with real-time voice decoding, encryption support, and an intuitive GUI.
 
 This package provides:
 - Core TETRA decoding functionality
@@ -27,7 +27,7 @@ def __getattr__(name):
     if name in ["TetraDecoder", "TEADecryptor", "TetraKeyManager", "TetraProtocolParser"]:
         from tetraear.core import __dict__ as core_dict
         return core_dict[name]
-    elif name in ["SignalProcessor", "RTLCapture", "TetraSignalDetector"]:
+    elif name in ["SignalProcessor", "BladeRFCapture", "TetraSignalDetector"]:
         from tetraear.signal import __dict__ as signal_dict
         return signal_dict[name]
     elif name == "VoiceProcessor":
@@ -41,7 +41,7 @@ __all__ = [
     "TetraKeyManager",
     "TetraProtocolParser",
     "SignalProcessor",
-    "RTLCapture",
+    "BladeRFCapture",
     "TetraSignalDetector",
     "VoiceProcessor",
 ]

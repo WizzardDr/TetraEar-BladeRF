@@ -3,7 +3,7 @@ Signal processing and capture modules.
 
 This package contains modules for:
 - Signal processing (demodulation, filtering)
-- RTL-SDR device capture
+- BladeRF device capture
 - Frequency scanning and signal detection
 """
 
@@ -13,9 +13,9 @@ def __getattr__(name):
     if name == "SignalProcessor":
         from tetraear.signal.processor import SignalProcessor
         return SignalProcessor
-    elif name == "RTLCapture":
-        from tetraear.signal.capture import RTLCapture
-        return RTLCapture
+    elif name == "BladeRFCapture":
+        from tetraear.signal.capture import BladeRFCapture
+        return BladeRFCapture
     elif name == "TetraSignalDetector":
         from tetraear.signal.scanner import TetraSignalDetector
         return TetraSignalDetector
@@ -26,7 +26,7 @@ def __getattr__(name):
 
 __all__ = [
     "SignalProcessor",
-    "RTLCapture",
+    "BladeRFCapture",
     "TetraSignalDetector",
     "FrequencyScanner",
 ]

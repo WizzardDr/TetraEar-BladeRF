@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)](#)
 
-> 🎯 A modern, professional TETRA (Terrestrial Trunked Radio) decoder and analyzer for RTL-SDR with real-time voice decoding, encryption support, and an intuitive GUI.
+> 🎯 A modern, professional TETRA (Terrestrial Trunked Radio) decoder and analyzer for BladeRF with real-time voice decoding, encryption support, and an intuitive GUI.
 
 ---
 
@@ -56,7 +56,7 @@
 ## 📋 Requirements
 
 - **Python**: 3.8 or higher
-- **RTL-SDR**: Compatible USB dongle with drivers installed
+- **BladeRF**: Compatible USB transceiver with drivers installed
 - **Operating System**: Windows or Linux
 - **Optional**: TETRA speech codec binaries (`cdecoder.exe` + `sdecoder.exe`) for voice decoding
 

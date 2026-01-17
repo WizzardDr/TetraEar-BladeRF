@@ -190,7 +190,7 @@ from scipy.signal import resample
 import subprocess
 import tempfile
 
-from tetraear.signal.capture import RTLCapture
+from tetraear.signal.capture import BladeRFCapture
 from tetraear.signal.processor import SignalProcessor
 from tetraear.core.decoder import TetraDecoder
 from tetraear.core.crypto import TetraKeyManager
@@ -1638,13 +1638,13 @@ class ScannerDialog(QDialog):
             stop = float(self.stop_freq.text()) * 1e6
             step = float(self.step_freq.text()) * 1e3
             
-            # Import RTLCapture
-            from tetraear.signal.capture import RTLCapture
+            # Import BladeRFCapture
+            from tetraear.signal.capture import BladeRFCapture
             
-            # Create RTL capture instance
-            rtl = RTLCapture(frequency=start, sample_rate=2.4e6, gain=50)
+            # Create BladeRF capture instance
+            rtl = BladeRFCapture(frequency=start, sample_rate=2.4e6, gain=50)
             if not rtl.open():
-                QMessageBox.warning(self, "Error", "Failed to open RTL-SDR device")
+                QMessageBox.warning(self, "Error", "Failed to open BladeRF device")
                 return
             
             # Initialize scanner with noise floor and bottom threshold parameters
@@ -1864,16 +1864,16 @@ class CaptureThread(QThread):
         status_update_interval = 0.1  # 10 Hz for status updates
         
         try:
-            self.status_update.emit("Initializing RTL-SDR...")
-            # RTLCapture accepts 'auto' as string or numeric gain value
-            self.capture = RTLCapture(
+            self.status_update.emit("Initializing BladeRF...")
+            # BladeRFCapture accepts 'auto' as string or numeric gain value
+            self.capture = BladeRFCapture(
                 frequency=self.frequency,
                 sample_rate=self.sample_rate,
                 gain=self.gain
             )
             
             if not self.capture.open():
-                self.error_occurred.emit("Failed to open RTL-SDR")
+                self.error_occurred.emit("Failed to open BladeRF")
                 return
             
             self.processor = SignalProcessor(sample_rate=self.sample_rate)
@@ -5453,13 +5453,13 @@ Examples:
         print("=" * 60)
         print("SCANNING FOR TETRA SIGNALS")
         print("=" * 60)
-        from tetraear.signal.capture import RTLCapture
+        from tetraear.signal.capture import BladeRFCapture
         from tetraear.signal.scanner import FrequencyScanner
         
         start_freq = args.scan[0] * 1e6
         stop_freq = args.scan[1] * 1e6
         
-        rtl = RTLCapture(frequency=start_freq, sample_rate=2.4e6, gain=50)
+        rtl = BladeRFCapture(frequency=start_freq, sample_rate=2.4e6, gain=50)
         if rtl.open():
             scanner = FrequencyScanner(
                 rtl, 

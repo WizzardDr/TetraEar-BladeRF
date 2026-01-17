@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 
-from tetraear.signal.capture import RTLCapture
+from tetraear.signal.capture import BladeRFCapture
 from tetraear.signal.processor import SignalProcessor
 from tetraear.core.decoder import TetraDecoder
 from tetraear.audio.voice import VoiceProcessor
@@ -114,7 +114,7 @@ def main():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     text_log = log_dir / f"clear_text_{run_id}.txt"
     
-    capture = RTLCapture(frequency=392.241e6, sample_rate=2.4e6, gain="auto")
+    capture = BladeRFCapture(frequency=392.241e6, sample_rate=2.4e6, gain="auto")
     if not capture.open():
         print("[FAIL] RTL-SDR not found")
         return 1

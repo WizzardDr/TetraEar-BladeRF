@@ -308,7 +308,7 @@ class FrequencyScanner:
         Initialize frequency scanner.
         
         Args:
-            rtl_capture: RTLCapture instance
+            rtl_capture: BladeRFCapture instance
             sample_rate: Sample rate in Hz (default: 2.4 MHz per TETRA spec)
             scan_step: Frequency step size for scanning (default: 25 kHz - TETRA channel spacing)
             noise_floor: Noise floor threshold in dB (default: -45 dB)
