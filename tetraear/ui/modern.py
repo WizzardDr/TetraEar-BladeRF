@@ -190,7 +190,7 @@ from scipy.signal import resample
 import subprocess
 import tempfile
 
-from tetraear.signal.capture import BladeRFCapture
+from tetraear.signal.capture import BladeRFCapture, list_bladerf_devices
 from tetraear.signal.processor import SignalProcessor
 from tetraear.core.decoder import TetraDecoder
 from tetraear.core.crypto import TetraKeyManager
@@ -1808,6 +1808,7 @@ class CaptureThread(QThread):
         self.pending_freq = None
         self.last_signal_time = 0
         self.encryption_keys = []  # List of keys for bruteforce
+        self.device_identifier = None  # Selected device serial number
         
     def set_keys(self, keys):
         """Set encryption keys for bruteforce attempts."""
@@ -1816,6 +1817,11 @@ class CaptureThread(QThread):
             self.decoder.set_keys(keys)
             logger.info(f"Loaded {len(keys)} encryption keys into decoder")
         
+    def set_device(self, device_serial):
+        """Set the BladeRF device to use by serial number."""
+        self.device_identifier = device_serial
+        logger.info(f"Set device identifier: {device_serial}")
+    
     def set_monitor_raw(self, enabled):
         self.monitor_raw = enabled
         
@@ -1869,7 +1875,8 @@ class CaptureThread(QThread):
             self.capture = BladeRFCapture(
                 frequency=self.frequency,
                 sample_rate=self.sample_rate,
-                gain=self.gain
+                gain=self.gain,
+                device_identifier=self.device_identifier
             )
             
             if not self.capture.open():
@@ -2566,6 +2573,9 @@ class ModernTetraGUI(QMainWindow):
         # Load settings
         self.load_settings()
         
+        # Initialize device list
+        QTimer.singleShot(100, self.refresh_device_list)
+        
         # Update timer
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_displays)
@@ -2963,9 +2973,31 @@ class ModernTetraGUI(QMainWindow):
         left_col.addStretch()
         main_layout.addLayout(left_col, 1)  # Stretch factor
         
-        # Middle column: Gain and Sample Rate - compact
+        # Middle column: Device, Gain and Sample Rate - compact
         middle_col = QVBoxLayout()
         middle_col.setSpacing(6)
+        
+        # Device selector
+        device_group = QGroupBox("Device")
+        device_layout = QVBoxLayout()
+        device_row = QHBoxLayout()
+        device_row.setSpacing(8)
+        device_label = QLabel("Device:")
+        device_label.setMinimumWidth(50)
+        device_row.addWidget(device_label)
+        self.device_combo = QComboBox()
+        self.device_combo.currentTextChanged.connect(self.on_device_changed)
+        self.device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        device_row.addWidget(self.device_combo, 1)  # Stretch factor
+        self.refresh_devices_btn = QPushButton("🔄")
+        self.refresh_devices_btn.setMaximumWidth(40)
+        self.refresh_devices_btn.setMaximumHeight(24)
+        self.refresh_devices_btn.clicked.connect(self.refresh_device_list)
+        self.refresh_devices_btn.setToolTip("Refresh connected BladeRF devices")
+        device_row.addWidget(self.refresh_devices_btn)
+        device_layout.addLayout(device_row)
+        device_group.setLayout(device_layout)
+        middle_col.addWidget(device_group)
         
         # Gain slider
         gain_group = QGroupBox("Gain")
@@ -3718,6 +3750,53 @@ class ModernTetraGUI(QMainWindow):
             except:
                 pass
     
+    def refresh_device_list(self):
+        """Refresh the list of connected BladeRF devices."""
+        current_text = self.device_combo.currentText()
+        self.device_combo.clear()
+        
+        devices = list_bladerf_devices()
+        if not devices:
+            self.device_combo.addItem("No devices found")
+            self.device_combo.setEnabled(False)
+            logger.warning("No BladeRF devices detected")
+            return
+        
+        self.device_combo.setEnabled(True)
+        for i, device in enumerate(devices):
+            serial = device.get('serial', 'Unknown')
+            backend = device.get('backend', 'unknown')
+            device_num = device.get('device', 0)
+            instance = device.get('instance', 0)
+            display_text = f"{backend}:device={device_num},instance={instance} (S/N: {serial})"
+            self.device_combo.addItem(display_text, userData=serial)
+        
+        # Try to restore previous selection
+        if current_text and self.device_combo.findText(current_text) >= 0:
+            self.device_combo.setCurrentText(current_text)
+        else:
+            # Select first device by default
+            self.device_combo.setCurrentIndex(0)
+        
+        logger.info(f"Device list refreshed: {len(devices)} device(s) found")
+    
+    def on_device_changed(self, text):
+        """Handle device selection change."""
+        if text == "No devices found" or not hasattr(self, 'device_combo'):
+            return
+        
+        selected_serial = self.device_combo.currentData()
+        logger.info(f"Selected BladeRF device: {text} (Serial: {selected_serial})")
+        
+        # Store device selection in settings
+        try:
+            settings = self.load_settings()
+            settings['selected_device'] = selected_serial
+            self.save_settings(settings)
+        except:
+            pass
+    
+
     def on_gain_changed(self, gain_text):
         """Change gain (legacy method for compatibility)."""
         if self.capture_thread and self.capture_thread.isRunning():
@@ -3918,12 +3997,19 @@ class ModernTetraGUI(QMainWindow):
             else:
                 sample_rate = 2.4e6  # Default per TETRA spec
             
+            # Get selected device
+            device_serial = None
+            if hasattr(self, 'device_combo') and self.device_combo.currentData():
+                device_serial = self.device_combo.currentData()
+            
             self.capture_thread = CaptureThread()
             self.capture_thread.frequency = freq_hz
             self.capture_thread.gain = gain
             self.capture_thread.sample_rate = sample_rate
             self.capture_thread.auto_decrypt = self.auto_decrypt_cb.isChecked()
             self.capture_thread.set_monitor_raw(self.monitor_raw_cb.isChecked())
+            if device_serial:
+                self.capture_thread.set_device(device_serial)
             if self.encryption_keys:
                 self.capture_thread.set_keys(self.encryption_keys)
             
